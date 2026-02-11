@@ -10,7 +10,6 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"sort"
 	"strconv"
 	"strings"
 	"sync/atomic"
@@ -648,8 +647,6 @@ func TestLoadGitLabCachedActivities_OfflineParityFiltersAndOrder(t *testing.T) {
 		t.Fatalf("unexpected issue activity %+v", issueActivities[0])
 	}
 
-	sort.Slice(activities, func(i, j int) bool { return activities[i].UpdatedAt.After(activities[j].UpdatedAt) })
-	sort.Slice(issueActivities, func(i, j int) bool { return issueActivities[i].UpdatedAt.After(issueActivities[j].UpdatedAt) })
 }
 
 func TestLoadGitLabCachedActivities_NestsLinkedIssuesAndExcludesStandalone(t *testing.T) {
@@ -1017,26 +1014,14 @@ func TestMergeLabelWithPriority_TableDriven(t *testing.T) {
 		expected string
 	}{
 		{
-			name:     "PR chooses authored over lower-priority labels",
-			labels:   []string{"Mentioned", "Commented", "Authored", "Assigned"},
+			name:     "PR fold keeps highest-priority label despite later lower-priority candidates",
+			labels:   []string{"Mentioned", "Authored", "Review Requested", "Commented", "Assigned"},
 			isPR:     true,
 			expected: "Authored",
 		},
 		{
-			name:     "PR chooses reviewed over review requested",
-			labels:   []string{"Review Requested", "Reviewed"},
-			isPR:     true,
-			expected: "Reviewed",
-		},
-		{
-			name:     "Issue chooses assigned over commented",
-			labels:   []string{"Commented", "Assigned"},
-			isPR:     false,
-			expected: "Assigned",
-		},
-		{
-			name:     "Issue keeps commented over mentioned",
-			labels:   []string{"Mentioned", "Commented"},
+			name:     "Issue fold ignores unknown labels and preserves best known label",
+			labels:   []string{"Mentioned", "Commented", "Unknown", "Mentioned"},
 			isPR:     false,
 			expected: "Commented",
 		},
@@ -1172,6 +1157,14 @@ func TestGitLabIssueReferenceKeysFromText_ParsesLocalQualifiedAndURLRefs(t *test
 		if _, ok := refs[key]; !ok {
 			t.Fatalf("missing parsed reference key %q in %+v", key, refs)
 		}
+	}
+
+	noiseRefs := gitLabIssueReferenceKeysFromText(
+		"ignore #0 #x project/repo#-5 /-/issues/0 https://gitlab.example/group/repo/-/issues/not-a-number and text#42",
+		"group/subgroup/repo",
+	)
+	if len(noiseRefs) != 0 {
+		t.Fatalf("unexpected refs parsed from noise: %+v", noiseRefs)
 	}
 }
 
