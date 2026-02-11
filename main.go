@@ -8,24 +8,26 @@ import (
 	"fmt"
 	"hash/fnv"
 	"math"
+	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strconv"
 	"strings"
-	"sync"
 	"sync/atomic"
 	"time"
 
 	"github.com/fatih/color"
-	"github.com/google/go-github/v57/github"
+	gitlab "gitlab.com/gitlab-org/api/client-go"
 )
 
 type PRActivity struct {
 	Label      string
 	Owner      string
 	Repo       string
-	PR         *github.PullRequest
+	MR         MergeRequestModel
 	UpdatedAt  time.Time
 	HasUpdates bool
 	Issues     []IssueActivity
@@ -35,9 +37,34 @@ type IssueActivity struct {
 	Label      string
 	Owner      string
 	Repo       string
-	Issue      *github.Issue
+	Issue      IssueModel
 	UpdatedAt  time.Time
 	HasUpdates bool
+}
+
+type MergeRequestModel struct {
+	Number    int
+	Title     string
+	Body      string
+	State     string
+	UpdatedAt time.Time
+	WebURL    string
+	UserLogin string
+	Merged    bool
+}
+
+type IssueModel struct {
+	Number    int
+	Title     string
+	Body      string
+	State     string
+	UpdatedAt time.Time
+	WebURL    string
+	UserLogin string
+}
+
+type CommentModel struct {
+	Body string
 }
 
 type Progress struct {
@@ -46,20 +73,67 @@ type Progress struct {
 }
 
 type Config struct {
-	debugMode     bool
-	localMode     bool
-	showLinks     bool
-	timeRange     time.Duration
-	username      string
-	allowedRepos  map[string]bool
-	client        *github.Client
-	db            *Database
-	progress      *Progress
-	ctx           context.Context
-	dbErrorCount  atomic.Int32
+	debugMode        bool
+	localMode        bool
+	gitlabUserID     int64
+	showLinks        bool
+	timeRange        time.Duration
+	gitlabUsername   string
+	allowedRepos     map[string]bool
+	gitlabClient     *gitlab.Client
+	db               *Database
+	progress         *Progress
+	ctx              context.Context
+	dbErrorCount     atomic.Int32
 }
 
 var config Config
+
+var retryAfter = time.After
+
+const defaultGitLabBaseURL = "https://gitlab.com"
+
+func normalizeGitLabBaseURL(raw string) (string, error) {
+	baseURL := strings.TrimSpace(raw)
+	if baseURL == "" {
+		baseURL = defaultGitLabBaseURL
+	}
+
+	parsed, err := url.Parse(baseURL)
+	if err != nil {
+		return "", fmt.Errorf("invalid GitLab base URL %q: %w", baseURL, err)
+	}
+
+	if parsed.Scheme == "" || parsed.Host == "" {
+		return "", fmt.Errorf("invalid GitLab base URL %q: must include scheme and host", baseURL)
+	}
+
+	normalizedPath := strings.TrimSuffix(parsed.EscapedPath(), "/")
+	if normalizedPath == "" {
+		normalizedPath = "/api/v4"
+	} else if !strings.HasSuffix(normalizedPath, "/api/v4") {
+		normalizedPath += "/api/v4"
+	}
+
+	parsed.Path = normalizedPath
+	parsed.RawPath = ""
+
+	return parsed.String(), nil
+}
+
+func newGitLabClient(token, rawBaseURL string) (*gitlab.Client, string, error) {
+	normalizedBaseURL, err := normalizeGitLabBaseURL(rawBaseURL)
+	if err != nil {
+		return nil, "", err
+	}
+
+	client, err := gitlab.NewClient(token, gitlab.WithBaseURL(normalizedBaseURL))
+	if err != nil {
+		return nil, "", fmt.Errorf("failed to create GitLab client: %w", err)
+	}
+
+	return client, normalizedBaseURL, nil
+}
 
 func getPRLabelPriority(label string) int {
 	priorities := map[string]int{
@@ -170,6 +244,10 @@ func retryWithBackoff(operation func() error, operationName string) error {
 
 	backoff := initialBackoff
 	attempt := 1
+	retryCtx := config.ctx
+	if retryCtx == nil {
+		retryCtx = context.Background()
+	}
 
 	for {
 		err := operation()
@@ -177,51 +255,42 @@ func retryWithBackoff(operation func() error, operationName string) error {
 			return nil
 		}
 
-		// Check if this is a GitHub rate limit error with reset time
-		var rateLimitErr *github.RateLimitError
-		var abuseRateLimitErr *github.AbuseRateLimitError
+		var gitLabErr *gitlab.ErrorResponse
 		var waitTime time.Duration
 		var isRateLimitError bool
+		var isTransientServerError bool
+		shouldRetry := true
 
-		if errors.As(err, &rateLimitErr) {
-			// Primary rate limit error - use the reset time from the error
-			isRateLimitError = true
-			resetTime := rateLimitErr.Rate.Reset.Time
-			waitTime = time.Until(resetTime)
+		if errors.As(err, &gitLabErr) && gitLabErr.Response != nil {
+			statusCode := gitLabErr.Response.StatusCode
 
-			// Add a small buffer to ensure the rate limit has definitely reset
-			waitTime += 2 * time.Second
+			if statusCode == http.StatusTooManyRequests {
+				isRateLimitError = true
+				retryAfterSeconds, parseErr := strconv.Atoi(strings.TrimSpace(gitLabErr.Response.Header.Get("Retry-After")))
+				if parseErr == nil && retryAfterSeconds > 0 {
+					waitTime = time.Duration(retryAfterSeconds) * time.Second
+				} else if resetWait, ok := gitLabRateLimitResetWait(gitLabErr.Response.Header.Get("Ratelimit-Reset")); ok {
+					waitTime = resetWait
+				} else {
+					waitTime = time.Duration(math.Min(float64(backoff), float64(maxBackoff)))
+				}
 
-			// Cap at a reasonable maximum to avoid waiting forever if clock is wrong
-			if waitTime > 1*time.Hour {
-				waitTime = 1 * time.Hour
-			}
+				if config.debugMode {
+					fmt.Printf("  [%s] GitLab rate limit hit (attempt %d), waiting %v before retry...\n",
+						operationName, attempt, waitTime.Round(time.Second))
+				}
+			} else if statusCode >= http.StatusInternalServerError && statusCode <= 599 {
+				isTransientServerError = true
+				waitTime = time.Duration(math.Min(float64(backoff), float64(maxBackoff)))
 
-			// Ensure we wait at least 1 second
-			if waitTime < 1*time.Second {
-				waitTime = 1 * time.Second
-			}
-
-			if config.debugMode {
-				fmt.Printf("  [%s] Rate limit hit (attempt %d), reset at %v, waiting %v before retry...\n",
-					operationName, attempt, resetTime.Format("15:04:05"), waitTime.Round(time.Second))
-			}
-		} else if errors.As(err, &abuseRateLimitErr) {
-			// Secondary/abuse rate limit error - use RetryAfter if available
-			isRateLimitError = true
-			if abuseRateLimitErr.RetryAfter != nil {
-				waitTime = *abuseRateLimitErr.RetryAfter
+				if config.debugMode {
+					fmt.Printf("  [%s] GitLab server error %d (attempt %d), waiting %v before retry...\n",
+						operationName, statusCode, attempt, waitTime)
+				}
 			} else {
-				// If no RetryAfter specified, use a default wait time
-				waitTime = 60 * time.Second
+				shouldRetry = false
 			}
-
-			if config.debugMode {
-				fmt.Printf("  [%s] Abuse rate limit hit (attempt %d), waiting %v before retry...\n",
-					operationName, attempt, waitTime.Round(time.Second))
-			}
-		} else {
-			// Check if error message suggests rate limiting (fallback for older errors)
+			} else {
 			isRateLimitError = strings.Contains(err.Error(), "rate limit") ||
 				strings.Contains(err.Error(), "API rate limit exceeded") ||
 				strings.Contains(err.Error(), "403")
@@ -236,12 +305,16 @@ func retryWithBackoff(operation func() error, operationName string) error {
 			}
 		}
 
+		if !shouldRetry {
+			return err
+		}
+
 		if isRateLimitError {
 			if config.debugMode {
 				select {
-				case <-config.ctx.Done():
-					return config.ctx.Err()
-				case <-time.After(waitTime):
+				case <-retryCtx.Done():
+					return retryCtx.Err()
+				case <-retryAfter(waitTime):
 				}
 			} else {
 				ticker := time.NewTicker(1 * time.Second)
@@ -254,8 +327,35 @@ func retryWithBackoff(operation func() error, operationName string) error {
 					}
 
 					select {
-					case <-config.ctx.Done():
-						return config.ctx.Err()
+					case <-retryCtx.Done():
+						return retryCtx.Err()
+					case <-ticker.C:
+						remaining--
+					}
+				}
+			}
+
+			backoff = time.Duration(float64(backoff) * backoffFactor)
+		} else if isTransientServerError {
+			if config.debugMode {
+				select {
+				case <-retryCtx.Done():
+					return retryCtx.Err()
+				case <-retryAfter(waitTime):
+				}
+			} else {
+				ticker := time.NewTicker(1 * time.Second)
+				defer ticker.Stop()
+
+				remaining := int(waitTime.Seconds())
+				for remaining > 0 {
+					if config.progress != nil {
+						config.progress.displayWithWarning(fmt.Sprintf("API error, retrying in %ds", remaining))
+					}
+
+					select {
+					case <-retryCtx.Done():
+						return retryCtx.Err()
 					case <-ticker.C:
 						remaining--
 					}
@@ -271,9 +371,9 @@ func retryWithBackoff(operation func() error, operationName string) error {
 				fmt.Printf("  [%s] Error (attempt %d): %v, waiting %v before retry...\n",
 					operationName, attempt, err, waitTime)
 				select {
-				case <-config.ctx.Done():
-					return config.ctx.Err()
-				case <-time.After(waitTime):
+				case <-retryCtx.Done():
+					return retryCtx.Err()
+				case <-retryAfter(waitTime):
 				}
 			} else {
 				ticker := time.NewTicker(1 * time.Second)
@@ -286,8 +386,8 @@ func retryWithBackoff(operation func() error, operationName string) error {
 					}
 
 					select {
-					case <-config.ctx.Done():
-						return config.ctx.Err()
+					case <-retryCtx.Done():
+						return retryCtx.Err()
 					case <-ticker.C:
 						remaining--
 					}
@@ -299,6 +399,21 @@ func retryWithBackoff(operation func() error, operationName string) error {
 
 		attempt++
 	}
+}
+
+func gitLabRateLimitResetWait(rawHeader string) (time.Duration, bool) {
+	resetAtUnix, err := strconv.ParseInt(strings.TrimSpace(rawHeader), 10, 64)
+	if err != nil || resetAtUnix <= 0 {
+		return 0, false
+	}
+
+	resetTime := time.Unix(resetAtUnix, 0)
+	waitTime := time.Until(resetTime)
+	if waitTime <= 0 {
+		return 1 * time.Second, true
+	}
+
+	return waitTime, true
 }
 
 func getLabelColor(label string) *color.Color {
@@ -372,6 +487,9 @@ func loadEnvFile(path string) error {
 		if len(parts) == 2 {
 			key := strings.TrimSpace(parts[0])
 			value := strings.TrimSpace(parts[1])
+			if _, exists := os.LookupEnv(key); exists {
+				continue
+			}
 			os.Setenv(key, value)
 		}
 	}
@@ -423,24 +541,26 @@ func main() {
 
 	flag.StringVar(&timeRangeStr, "time", "1m", "Show items from last time range (1h, 2d, 3w, 4m, 1y)")
 	flag.BoolVar(&debugMode, "debug", false, "Show detailed API logging")
-	flag.BoolVar(&localMode, "local", false, "Use local database instead of GitHub API")
+	flag.BoolVar(&localMode, "local", false, "Use local database instead of GitLab API")
 	flag.BoolVar(&showLinks, "links", false, "Show hyperlinks underneath each PR/issue")
 	flag.BoolVar(&llMode, "ll", false, "Shortcut for --local --links (offline mode with links)")
 	flag.BoolVar(&cleanCache, "clean", false, "Delete and recreate the database cache")
-	flag.StringVar(&allowedReposFlag, "allowed-repos", "", "Comma-separated list of allowed repos (e.g., user/repo1,user/repo2)")
+	flag.StringVar(&allowedReposFlag, "allowed-repos", "", "Comma-separated list of allowed repos (e.g., group/repo,group/subgroup/repo)")
 
 	// Custom usage message
 	flag.Usage = func() {
 		fmt.Fprintf(os.Stderr, "Usage: %s [options]\n\n", os.Args[0])
-		fmt.Fprintln(os.Stderr, "GitHub Feed - Monitor GitHub pull requests and issues across repositories")
+		fmt.Fprintln(os.Stderr, "GitLab Feed - Monitor pull requests and issues across repositories")
 		fmt.Fprintln(os.Stderr, "\nOptions:")
 		flag.PrintDefaults()
 		fmt.Fprintln(os.Stderr, "\nEnvironment Variables:")
-		fmt.Fprintln(os.Stderr, "  GITHUB_TOKEN or GITHUB_ACTIVITY_TOKEN - GitHub Personal Access Token")
-		fmt.Fprintln(os.Stderr, "  GITHUB_USERNAME or GITHUB_USER         - Your GitHub username")
-		fmt.Fprintln(os.Stderr, "  ALLOWED_REPOS                          - Comma-separated list of allowed repos")
+		fmt.Fprintln(os.Stderr, "  GITLAB_TOKEN or GITLAB_ACTIVITY_TOKEN  - GitLab Personal Access Token")
+		fmt.Fprintln(os.Stderr, "  GITLAB_USERNAME or GITLAB_USER         - Optional GitLab username")
+		fmt.Fprintln(os.Stderr, "  GITLAB_HOST                            - Optional GitLab host (overrides GITLAB_BASE_URL when set)")
+		fmt.Fprintln(os.Stderr, "  GITLAB_BASE_URL                        - Optional GitLab base URL (default: https://gitlab.com)")
+		fmt.Fprintln(os.Stderr, "  ALLOWED_REPOS                          - Required in online mode (group[/subgroup]/repo)")
 		fmt.Fprintln(os.Stderr, "\nConfiguration File:")
-		fmt.Fprintln(os.Stderr, "  ~/.github-feed/.env                    - Configuration file (auto-created)")
+		fmt.Fprintln(os.Stderr, "  ~/.gitlab-feed/.env                    - Configuration file (auto-created)")
 	}
 
 	flag.Parse()
@@ -465,7 +585,7 @@ func main() {
 		os.Exit(1)
 	}
 
-	configDir := filepath.Join(homeDir, ".github-feed")
+	configDir := filepath.Join(homeDir, ".gitlab-feed")
 	if err := os.MkdirAll(configDir, 0o755); err != nil {
 		fmt.Printf("Error: Could not create config directory %s: %v\n", configDir, err)
 		os.Exit(1)
@@ -473,19 +593,28 @@ func main() {
 
 	envPath := filepath.Join(configDir, ".env")
 	if _, err := os.Stat(envPath); os.IsNotExist(err) {
-		envTemplate := `# GitHub Feed Configuration
-# Add your GitHub credentials here
+		envTemplate := `# Activity Feed Configuration
+# Add your API credentials here
 
-# Your GitHub Personal Access Token (required)
-# Generate at: https://github.com/settings/tokens
-# Required scopes: repo, read:org
-GITHUB_TOKEN=
+# Your GitLab Personal Access Token (required for online mode)
+# Recommended scope: read_api (or api on some self-managed instances)
+GITLAB_TOKEN=
 
-# Your GitHub username (required)
-GITHUB_USERNAME=
+# Optional username (the app also resolves the current user via API)
+GITLAB_USERNAME=
 
-# Optional: Comma-separated list of allowed repos (e.g., user/repo1,user/repo2)
-# Leave empty to allow all repos
+		# Optional: GitLab host for self-managed/cloud instances
+		# Example: http://10.10.1.207/
+		# If set, this overrides GITLAB_BASE_URL.
+		GITLAB_HOST=
+
+		# Optional: full GitLab base URL (supports path prefixes)
+		# Default: https://gitlab.com
+		GITLAB_BASE_URL=https://gitlab.com
+
+# Required in online mode: comma-separated allowed repos
+# Format: group/repo or group/subgroup/repo
+# Example self-managed repo path: platform/backend/gitlab-feed
 ALLOWED_REPOS=
 `
 		if err := os.WriteFile(envPath, []byte(envTemplate), 0o600); err != nil {
@@ -494,11 +623,6 @@ ALLOWED_REPOS=
 	}
 
 	_ = loadEnvFile(envPath)
-
-	username := os.Getenv("GITHUB_USERNAME")
-	if username == "" {
-		username = os.Getenv("GITHUB_USER")
-	}
 
 	allowedReposStr := allowedReposFlag
 	if allowedReposStr == "" {
@@ -520,7 +644,7 @@ ALLOWED_REPOS=
 		}
 	}
 
-	dbPath := filepath.Join(configDir, "github.db")
+	dbPath := filepath.Join(configDir, "gitlab.db")
 
 	if cleanCache {
 		fmt.Println("Cleaning database cache...")
@@ -544,20 +668,62 @@ ALLOWED_REPOS=
 		defer db.Close()
 	}
 
-	token := os.Getenv("GITHUB_ACTIVITY_TOKEN")
+	token := os.Getenv("GITLAB_ACTIVITY_TOKEN")
 	if token == "" {
-		token = os.Getenv("GITHUB_TOKEN")
+		token = os.Getenv("GITLAB_TOKEN")
+	}
+
+	rawGitLabHost := os.Getenv("GITLAB_HOST")
+	rawGitLabBaseURL := os.Getenv("GITLAB_BASE_URL")
+	selectedGitLabBaseURL := rawGitLabBaseURL
+	if strings.TrimSpace(rawGitLabHost) != "" {
+		selectedGitLabBaseURL = rawGitLabHost
+	}
+
+	normalizedGitLabBaseURL, err := normalizeGitLabBaseURL(selectedGitLabBaseURL)
+	if err != nil {
+		if strings.TrimSpace(selectedGitLabBaseURL) != "" {
+			fmt.Printf("Configuration Error: %v\n", err)
+			os.Exit(1)
+		}
+
+		normalizedGitLabBaseURL, _ = normalizeGitLabBaseURL("")
+	}
+
+	var gitlabClient *gitlab.Client
+	gitlabUsername := ""
+	var gitlabUserID int64
+	if !localMode && token != "" {
+		client, _, err := newGitLabClient(token, selectedGitLabBaseURL)
+		if err != nil {
+			fmt.Printf("Configuration Error: %v\n", err)
+			os.Exit(1)
+		}
+		gitlabClient = client
+
+		currentUser, _, err := gitlabClient.Users.CurrentUser(gitlab.WithContext(context.Background()))
+		if err != nil {
+			fmt.Printf("Configuration Error: failed to fetch GitLab current user: %v\n", err)
+			os.Exit(1)
+		}
+		gitlabUsername = strings.TrimSpace(currentUser.Username)
+		gitlabUserID = currentUser.ID
+		if gitlabUsername == "" {
+			fmt.Println("Configuration Error: GitLab current user has empty username")
+			os.Exit(1)
+		}
 	}
 
 	// Validate configuration
-	if err := validateConfig(username, token, localMode, envPath); err != nil {
+	if err := validateConfig(token, localMode, envPath, allowedRepos); err != nil {
 		fmt.Printf("Configuration Error: %v\n\n", err)
 		os.Exit(1)
 	}
 
 	if debugMode {
-		fmt.Printf("Monitoring GitHub PR activity for user: %s\n", username)
+		fmt.Println("Monitoring GitLab merge request and issue activity")
 		fmt.Printf("Showing items from the last %v\n", timeRange)
+		fmt.Printf("GitLab API base URL: %s\n", normalizedGitLabBaseURL)
 	}
 	if debugMode {
 		fmt.Println("Debug mode enabled")
@@ -565,297 +731,175 @@ ALLOWED_REPOS=
 
 	config.debugMode = debugMode
 	config.localMode = localMode
+	config.gitlabUserID = gitlabUserID
 	config.showLinks = showLinks
 	config.timeRange = timeRange
-	config.username = username
+	config.gitlabUsername = gitlabUsername
 	config.allowedRepos = allowedRepos
 	config.db = db
 	config.ctx = context.Background()
-	config.client = github.NewClient(nil).WithAuthToken(token)
+	config.gitlabClient = gitlabClient
 
 	fetchAndDisplayActivity()
 }
 
-func validateConfig(username, token string, localMode bool, envPath string) error {
+func validateConfig(token string, localMode bool, envPath string, allowedRepos map[string]bool) error {
 	if localMode {
 		return nil // No validation needed for offline mode
 	}
 
-	if username == "" {
-		return fmt.Errorf("GitHub username is required.\n\nTo fix this:\n  - Set GITHUB_USERNAME environment variable\n  - Or add it to %s", envPath)
-	}
-
 	if token == "" {
-		return fmt.Errorf("GitHub token is required.\n\nTo fix this:\n  1. Generate a token at https://github.com/settings/tokens\n  2. Click 'Generate new token' -> 'Generate new token (classic)'\n  3. Give it a name and select scopes: 'repo', 'read:org'\n  4. Generate and copy the token\n  5. Set GITHUB_TOKEN environment variable\n  6. Or add it to %s", envPath)
+		return fmt.Errorf("token is required for GitLab API mode.\n\nTo fix this:\n  - Set GITLAB_TOKEN or GITLAB_ACTIVITY_TOKEN\n  - Or add it to %s", envPath)
 	}
-
-	// Validate token format (GitHub PAT tokens start with ghp_, gho_, or github_pat_)
-	if !strings.HasPrefix(token, "ghp_") &&
-		!strings.HasPrefix(token, "gho_") &&
-		!strings.HasPrefix(token, "github_pat_") {
-		return fmt.Errorf("GitHub token format looks invalid.\n\nGitHub Personal Access Tokens should start with:\n  - 'ghp_' (classic PAT)\n  - 'gho_' (OAuth token)\n  - 'github_pat_' (fine-grained PAT)\n\nYour token starts with: '%s'\n\nPlease check your token at https://github.com/settings/tokens", token[:min(10, len(token))])
+	if len(allowedRepos) == 0 {
+		return fmt.Errorf("ALLOWED_REPOS is required for GitLab API mode to keep API usage bounded.\n\nTo fix this:\n  - Set ALLOWED_REPOS with group[/subgroup]/repo paths\n  - Example: ALLOWED_REPOS=team/service,platform/backend/gitlab-feed\n  - Or add it to %s", envPath)
 	}
-
-	return nil
-}
-
-func isRepoAllowed(owner, repo string) bool {
-	if config.allowedRepos == nil || len(config.allowedRepos) == 0 {
-		return true
-	}
-	repoKey := fmt.Sprintf("%s/%s", owner, repo)
-	return config.allowedRepos[repoKey]
-}
-
-func checkRateLimit() error {
-	var rateLimits *github.RateLimits
-	var err error
-
-	retryErr := retryWithBackoff(func() error {
-		rateLimits, _, err = config.client.RateLimit.Get(config.ctx)
-		return err
-	}, "RateLimitCheck")
-
-	if retryErr != nil {
-		return fmt.Errorf("failed to fetch rate limit: %w", retryErr)
-	}
-
-	core := rateLimits.Core
-	search := rateLimits.Search
-
-	if config.debugMode {
-		fmt.Printf("Rate Limits - Core: %d/%d, Search: %d/%d\n",
-			core.Remaining, core.Limit,
-			search.Remaining, search.Limit)
-	}
-
-	if core.Remaining == 0 {
-		resetTime := core.Reset.Time.Sub(time.Now())
-		fmt.Printf("WARNING: Core API rate limit exceeded! Resets in %v\n", resetTime.Round(time.Second))
-		return fmt.Errorf("rate limit exceeded, resets at %v", core.Reset.Time.Format("15:04:05"))
-	}
-
-	if search.Remaining == 0 {
-		resetTime := search.Reset.Time.Sub(time.Now())
-		fmt.Printf("WARNING: Search API rate limit exceeded! Resets in %v\n", resetTime.Round(time.Second))
-		return fmt.Errorf("search rate limit exceeded, resets at %v", search.Reset.Time.Format("15:04:05"))
-	}
-
-	coreThreshold := core.Limit / 5
-	if core.Remaining < coreThreshold && core.Remaining > 0 {
-		fmt.Printf("WARNING: Core API rate limit running low (%d remaining)\n", core.Remaining)
-	}
-
-	if search.Remaining < 5 && search.Remaining > 0 {
-		fmt.Printf("WARNING: Search API rate limit running low (%d remaining)\n", search.Remaining)
-	}
-
 	return nil
 }
 
 func fetchAndDisplayActivity() {
+	fetchAndDisplayGitLabActivity()
+}
+
+type DisplayConfig struct {
+	Owner      string
+	Repo       string
+	Number     int
+	Title      string
+	User       string
+	UpdatedAt  time.Time
+	WebURL     string
+	Label      string
+	HasUpdates bool
+	IsIndented bool
+	State      string
+}
+
+func displayItem(cfg DisplayConfig) {
+	dateStr := "          "
+	if !cfg.UpdatedAt.IsZero() {
+		dateStr = cfg.UpdatedAt.Format("2006/01/02")
+	}
+
+	indent := ""
+	linkIndent := "   "
+	if cfg.IsIndented && cfg.State != "" {
+		state := strings.ToUpper(cfg.State)
+		stateColor := getStateColor(cfg.State)
+		indent = fmt.Sprintf("-- %s ", stateColor.Sprint(state))
+		linkIndent = "      "
+	}
+
+	labelColor := getLabelColor(cfg.Label)
+	userColor := getUserColor(cfg.User)
+
+	updateIcon := ""
+	if cfg.HasUpdates {
+		updateIcon = color.New(color.FgYellow, color.Bold).Sprint("● ")
+	}
+
+	repoDisplay := ""
+	if cfg.Repo == "" {
+		repoDisplay = fmt.Sprintf("%s#%d", cfg.Owner, cfg.Number)
+	} else {
+		repoDisplay = fmt.Sprintf("%s/%s#%d", cfg.Owner, cfg.Repo, cfg.Number)
+	}
+
+	fmt.Printf("%s%s%s %s %s %s - %s\n",
+		updateIcon,
+		indent,
+		dateStr,
+		labelColor.Sprint(strings.ToUpper(cfg.Label)),
+		userColor.Sprint(cfg.User),
+		repoDisplay,
+		cfg.Title,
+	)
+
+	if config.showLinks && cfg.WebURL != "" {
+		fmt.Printf("%s🔗 %s\n", linkIndent, cfg.WebURL)
+	}
+}
+
+func displayMergeRequest(label, owner, repo string, mr MergeRequestModel, hasUpdates bool) {
+	displayItem(DisplayConfig{
+		Owner:      owner,
+		Repo:       repo,
+		Number:     mr.Number,
+		Title:      mr.Title,
+		User:       mr.UserLogin,
+		UpdatedAt:  mr.UpdatedAt,
+		WebURL:     mr.WebURL,
+		Label:      label,
+		HasUpdates: hasUpdates,
+		IsIndented: false,
+	})
+}
+
+func displayIssue(label, owner, repo string, issue IssueModel, indented bool, hasUpdates bool) {
+	displayItem(DisplayConfig{
+		Owner:      owner,
+		Repo:       repo,
+		Number:     issue.Number,
+		Title:      issue.Title,
+		User:       issue.UserLogin,
+		UpdatedAt:  issue.UpdatedAt,
+		WebURL:     issue.WebURL,
+		Label:      label,
+		HasUpdates: hasUpdates,
+		IsIndented: indented,
+		State:      issue.State,
+	})
+}
+
+type gitLabProject struct {
+	PathWithNamespace string
+	ID                int64
+}
+
+func fetchAndDisplayGitLabActivity() {
 	startTime := time.Now()
 
-	if !config.localMode {
-		if err := checkRateLimit(); err != nil {
-			fmt.Printf("Skipping this cycle due to rate limit: %v\n", err)
-			return
-		}
-		if config.debugMode {
-			fmt.Println()
-		}
-	}
-
-	var seenPRs sync.Map        // Maps prKey -> label
-	activitiesMap := sync.Map{} // Maps prKey -> *PRActivity
-
-	// 6 PR queries + 4 issue queries = 10 total
-	initialTotal := 10
-	if !config.localMode {
-		initialTotal += 3 // Add 3 for event pages
-	}
-	config.progress = &Progress{}
-	config.progress.current.Store(0)
-	config.progress.total.Store(int32(initialTotal))
-
 	if config.debugMode {
-		fmt.Println("Running optimized search queries...")
+		fmt.Println("Fetching data from GitLab...")
 	} else {
-		fmt.Print("Fetching data from GitHub... ")
-		config.progress.display()
+		fmt.Print("Fetching data from GitLab... ")
 	}
 
-	dateAgo := time.Now().Add(-config.timeRange).Format("2006-01-02")
-	dateFilter := fmt.Sprintf("updated:>=%s", dateAgo)
+	cutoffTime := time.Now().Add(-config.timeRange)
+	var (
+		activities      []PRActivity
+		issueActivities []IssueActivity
+		err             error
+	)
 
-	buildQuery := func(base string) string {
-		return fmt.Sprintf("%s %s", base, dateFilter)
+	if config.localMode {
+		activities, issueActivities, err = loadGitLabCachedActivities(cutoffTime)
+	} else {
+		activities, issueActivities, err = fetchGitLabProjectActivities(
+			config.ctx,
+			config.gitlabClient,
+			config.allowedRepos,
+			cutoffTime,
+			config.gitlabUsername,
+			config.gitlabUserID,
+			config.db,
+		)
 	}
-
-	var prWg sync.WaitGroup
-
-	prQueries := []struct {
-		query string
-		label string
-	}{
-		{buildQuery(fmt.Sprintf("is:pr reviewed-by:%s", config.username)), "Reviewed"},
-		{buildQuery(fmt.Sprintf("is:pr review-requested:%s", config.username)), "Review Requested"},
-		{buildQuery(fmt.Sprintf("is:pr author:%s", config.username)), "Authored"},
-		{buildQuery(fmt.Sprintf("is:pr assignee:%s", config.username)), "Assigned"},
-		{buildQuery(fmt.Sprintf("is:pr commenter:%s", config.username)), "Commented"},
-		{buildQuery(fmt.Sprintf("is:pr mentions:%s", config.username)), "Mentioned"},
+	if err != nil {
+		fmt.Printf("Error fetching GitLab activity: %v\n", err)
+		return
 	}
-
-	for _, pq := range prQueries {
-		query := pq.query
-		label := pq.label
-		prWg.Go(func() {
-			collectSearchResults(query, label, &seenPRs, &activitiesMap)
-		})
-	}
-
-	prWg.Wait()
 
 	if config.debugMode {
 		fmt.Println()
-		fmt.Println("Running issue search queries...")
-	}
-	var seenIssues sync.Map          // Maps issueKey -> label
-	issueActivitiesMap := sync.Map{} // Maps issueKey -> *IssueActivity
-
-	var issueWg sync.WaitGroup
-
-	issueQueries := []struct {
-		query string
-		label string
-	}{
-		{buildQuery(fmt.Sprintf("is:issue author:%s", config.username)), "Authored"},
-		{buildQuery(fmt.Sprintf("is:issue mentions:%s", config.username)), "Mentioned"},
-		{buildQuery(fmt.Sprintf("is:issue assignee:%s", config.username)), "Assigned"},
-		{buildQuery(fmt.Sprintf("is:issue commenter:%s", config.username)), "Commented"},
-	}
-
-	for _, iq := range issueQueries {
-		query := iq.query
-		label := iq.label
-		issueWg.Go(func() {
-			collectIssueSearchResults(query, label, &seenIssues, &issueActivitiesMap)
-		})
-	}
-
-	issueWg.Wait()
-
-	// Convert activitiesMap to slice
-	activities := []PRActivity{}
-	activitiesMap.Range(func(key, value interface{}) bool {
-		if activity, ok := value.(*PRActivity); ok {
-			activities = append(activities, *activity)
-		}
-		return true
-	})
-
-	// Convert issueActivitiesMap to slice
-	issueActivities := []IssueActivity{}
-	issueActivitiesMap.Range(func(key, value interface{}) bool {
-		if activity, ok := value.(*IssueActivity); ok {
-			issueActivities = append(issueActivities, *activity)
-		}
-		return true
-	})
-
-	if config.debugMode {
-		fmt.Println("Checking cross-references between PRs and issues...")
-	}
-
-	linkedIssues := make(map[string]bool)
-
-	// Channel-based approach to avoid race conditions
-	type crossRefResult struct {
-		prIndex   int
-		issue     IssueActivity
-		issueKey  string
-		debugInfo string
-	}
-	resultsChan := make(chan crossRefResult, 100)
-
-	var wg sync.WaitGroup
-
-	// Launch collector goroutine to handle all appends and map writes
-	collectorDone := make(chan struct{})
-	go func() {
-		for result := range resultsChan {
-			// Safe to modify since only this goroutine accesses these
-			activities[result.prIndex].Issues = append(activities[result.prIndex].Issues, result.issue)
-			linkedIssues[result.issueKey] = true
-			if config.debugMode {
-				fmt.Println(result.debugInfo)
-			}
-		}
-		close(collectorDone)
-	}()
-
-	for j := range issueActivities {
-		issue := &issueActivities[j]
-		issueKey := buildItemKey(issue.Owner, issue.Repo, issue.Issue.GetNumber())
-
-		for i := range activities {
-			pr := &activities[i]
-			if pr.Owner == issue.Owner && pr.Repo == issue.Repo {
-				// Capture loop variables
-				prIndex := i
-				issueCopy := *issue
-				issueKeyCopy := issueKey
-				prCopy := pr
-				wg.Go(func() {
-					if areCrossReferenced(prCopy, &issueCopy) {
-						debugInfo := ""
-						if config.debugMode {
-							debugInfo = fmt.Sprintf("  Linked %s/%s#%d <-> %s/%s#%d",
-								prCopy.Owner, prCopy.Repo, prCopy.PR.GetNumber(),
-								issueCopy.Owner, issueCopy.Repo, issueCopy.Issue.GetNumber())
-						}
-						resultsChan <- crossRefResult{
-							prIndex:   prIndex,
-							issue:     issueCopy,
-							issueKey:  issueKeyCopy,
-							debugInfo: debugInfo,
-						}
-					}
-				})
-			}
-		}
-	}
-
-	wg.Wait()
-	close(resultsChan)
-	<-collectorDone
-
-	standaloneIssues := []IssueActivity{}
-	for _, issue := range issueActivities {
-		issueKey := buildItemKey(issue.Owner, issue.Repo, issue.Issue.GetNumber())
-		if !linkedIssues[issueKey] {
-			standaloneIssues = append(standaloneIssues, issue)
-		}
-	}
-
-	duration := time.Since(startTime)
-	if config.debugMode {
-		fmt.Println()
-		fmt.Printf("Total fetch time: %v\n", duration.Round(time.Millisecond))
-		fmt.Printf("Found %d unique PRs and %d unique issues\n", len(activities), len(issueActivities))
-
-		if config.db != nil {
-			prCount, issueCount, commentCount, err := config.db.Stats()
-			if err == nil {
-				fmt.Printf("Database stats: %d PRs, %d issues, %d comments\n", prCount, issueCount, commentCount)
-			}
-		}
+		fmt.Printf("Total fetch time: %v\n", time.Since(startTime).Round(time.Millisecond))
+		fmt.Printf("Found %d unique merge requests and %d unique issues\n", len(activities), len(issueActivities))
 		fmt.Println()
 	} else {
 		fmt.Print("\r" + strings.Repeat(" ", 80) + "\r")
 	}
 
-	if len(activities) == 0 && len(standaloneIssues) == 0 {
+	if len(activities) == 0 && len(issueActivities) == 0 {
 		fmt.Println("No open activity found")
 		return
 	}
@@ -863,14 +907,14 @@ func fetchAndDisplayActivity() {
 	sort.Slice(activities, func(i, j int) bool {
 		return activities[i].UpdatedAt.After(activities[j].UpdatedAt)
 	})
-	sort.Slice(standaloneIssues, func(i, j int) bool {
-		return standaloneIssues[i].UpdatedAt.After(standaloneIssues[j].UpdatedAt)
+	sort.Slice(issueActivities, func(i, j int) bool {
+		return issueActivities[i].UpdatedAt.After(issueActivities[j].UpdatedAt)
 	})
 
 	var openPRs, closedPRs, mergedPRs []PRActivity
 	for _, activity := range activities {
-		if activity.PR.State != nil && *activity.PR.State == "closed" {
-			if activity.PR.Merged != nil && *activity.PR.Merged {
+		if activity.MR.State == "closed" {
+			if activity.MR.Merged {
 				mergedPRs = append(mergedPRs, activity)
 			} else {
 				closedPRs = append(closedPRs, activity)
@@ -881,8 +925,8 @@ func fetchAndDisplayActivity() {
 	}
 
 	var openIssues, closedIssues []IssueActivity
-	for _, issue := range standaloneIssues {
-		if issue.Issue.State != nil && *issue.Issue.State == "closed" {
+	for _, issue := range issueActivities {
+		if issue.Issue.State == "closed" {
 			closedIssues = append(closedIssues, issue)
 		} else {
 			openIssues = append(openIssues, issue)
@@ -894,7 +938,7 @@ func fetchAndDisplayActivity() {
 		fmt.Println(titleColor.Sprint("OPEN PULL REQUESTS:"))
 		fmt.Println("------------------------------------------")
 		for _, activity := range openPRs {
-			displayPR(activity.Label, activity.Owner, activity.Repo, activity.PR, activity.HasUpdates)
+			displayMergeRequest(activity.Label, activity.Owner, activity.Repo, activity.MR, activity.HasUpdates)
 			if len(activity.Issues) > 0 {
 				for _, issue := range activity.Issues {
 					displayIssue(issue.Label, issue.Owner, issue.Repo, issue.Issue, true, issue.HasUpdates)
@@ -903,13 +947,21 @@ func fetchAndDisplayActivity() {
 		}
 	}
 
-	if len(closedPRs) > 0 {
+	if len(closedPRs) > 0 || len(mergedPRs) > 0 {
 		fmt.Println()
 		titleColor := color.New(color.FgHiRed, color.Bold)
 		fmt.Println(titleColor.Sprint("CLOSED/MERGED PULL REQUESTS:"))
 		fmt.Println("------------------------------------------")
+		for _, activity := range mergedPRs {
+			displayMergeRequest(activity.Label, activity.Owner, activity.Repo, activity.MR, activity.HasUpdates)
+			if len(activity.Issues) > 0 {
+				for _, issue := range activity.Issues {
+					displayIssue(issue.Label, issue.Owner, issue.Repo, issue.Issue, true, issue.HasUpdates)
+				}
+			}
+		}
 		for _, activity := range closedPRs {
-			displayPR(activity.Label, activity.Owner, activity.Repo, activity.PR, activity.HasUpdates)
+			displayMergeRequest(activity.Label, activity.Owner, activity.Repo, activity.MR, activity.HasUpdates)
 			if len(activity.Issues) > 0 {
 				for _, issue := range activity.Issues {
 					displayIssue(issue.Label, issue.Owner, issue.Repo, issue.Issue, true, issue.HasUpdates)
@@ -937,720 +989,1006 @@ func fetchAndDisplayActivity() {
 			displayIssue(issue.Label, issue.Owner, issue.Repo, issue.Issue, false, issue.HasUpdates)
 		}
 	}
-
-	// Warn about database errors if any occurred
-	if dbErrors := config.dbErrorCount.Load(); dbErrors > 0 {
-		fmt.Printf("\n")
-		warningColor := color.New(color.FgYellow, color.Bold)
-		fmt.Printf("%s %d database write error(s) occurred. Offline mode may be incomplete.\n",
-			warningColor.Sprint("Warning:"), dbErrors)
-		if !config.debugMode {
-			fmt.Println("Run with --debug to see detailed error messages.")
-		}
-	}
 }
 
-func areCrossReferenced(pr *PRActivity, issue *IssueActivity) bool {
-	prNumber := pr.PR.GetNumber()
-	issueNumber := issue.Issue.GetNumber()
-
-	if config.debugMode {
-		fmt.Printf("  Checking cross-reference: PR %s/%s#%d <-> Issue %s/%s#%d\n",
-			pr.Owner, pr.Repo, prNumber,
-			issue.Owner, issue.Repo, issueNumber)
+func fetchGitLabProjectActivities(
+	ctx context.Context,
+	client *gitlab.Client,
+	allowedRepos map[string]bool,
+	cutoff time.Time,
+	currentUsername string,
+	currentUserID int64,
+	db *Database,
+) ([]PRActivity, []IssueActivity, error) {
+	projects, err := resolveAllowedGitLabProjects(ctx, client, allowedRepos)
+	if err != nil {
+		return nil, nil, err
 	}
 
-	prBody := pr.PR.GetBody()
-	if mentionsNumber(prBody, issueNumber, pr.Owner, pr.Repo) {
-		return true
+	currentUsername = strings.TrimSpace(currentUsername)
+	if currentUsername == "" {
+		return nil, nil, fmt.Errorf("gitlab current username is required")
 	}
 
-	issueBody := issue.Issue.GetBody()
-	if mentionsNumber(issueBody, prNumber, issue.Owner, issue.Repo) {
-		return true
+	if len(projects) == 0 {
+		return []PRActivity{}, []IssueActivity{}, nil
 	}
 
-	var prComments []*github.PullRequestComment
-	var err error
+	activities := make([]PRActivity, 0)
+	issueActivities := make([]IssueActivity, 0)
+	seenMergeRequests := make(map[string]struct{})
+	seenIssues := make(map[string]struct{})
+	projectIDByPath := make(map[string]int64, len(projects))
+	mrNotesByKey := make(map[string][]*gitlab.Note)
 
-	if config.localMode {
-		if config.db != nil {
-			prComments, err = config.db.GetPRComments(pr.Owner, pr.Repo, prNumber)
-			if err != nil && config.debugMode {
-				fmt.Printf("  Warning: Could not fetch comments from database for %s/%s#%d: %v\n",
-					pr.Owner, pr.Repo, prNumber, err)
+	for _, project := range projects {
+		projectIDByPath[normalizeProjectPathWithNamespace(project.PathWithNamespace)] = project.ID
+	}
+
+	for _, project := range projects {
+		projectMergeRequests, err := listGitLabProjectMergeRequests(ctx, client, project.ID, cutoff)
+		if err != nil {
+			return nil, nil, fmt.Errorf("list merge requests for %s: %w", project.PathWithNamespace, err)
+		}
+
+		for _, item := range projectMergeRequests {
+			key := buildGitLabDedupKey(project.PathWithNamespace, "mr", item.IID)
+			if _, exists := seenMergeRequests[key]; exists {
+				continue
 			}
-		}
-	} else {
-		config.progress.addToTotal(1)
-		if !config.debugMode {
-			config.progress.display()
-		}
+			seenMergeRequests[key] = struct{}{}
 
-		retryErr := retryWithBackoff(func() error {
-			prComments, _, err = config.client.PullRequests.ListComments(config.ctx, pr.Owner, pr.Repo, prNumber, &github.PullRequestListCommentsOptions{
-				ListOptions: github.ListOptions{PerPage: 100},
-			})
-			return err
-		}, fmt.Sprintf("Comments-PR#%d", prNumber))
+			model := toMergeRequestModelFromGitLab(item)
+			if model.UpdatedAt.IsZero() || model.UpdatedAt.Before(cutoff) {
+				continue
+			}
 
-		config.progress.increment()
-		if !config.debugMode {
-			config.progress.display()
-		}
+			label, notes, err := deriveGitLabMergeRequestLabel(ctx, client, project.ID, item, currentUsername, currentUserID)
+			if err != nil {
+				return nil, nil, fmt.Errorf("derive merge request label for %s!%d: %w", project.PathWithNamespace, item.IID, err)
+			}
 
-		if retryErr != nil {
-			err = retryErr
-		}
-
-		if err == nil && config.db != nil {
-			for _, comment := range prComments {
-				if err := config.db.SavePRComment(pr.Owner, pr.Repo, prNumber, comment, config.debugMode); err != nil {
+			if db != nil {
+				if err := db.SaveGitLabMergeRequestWithLabel(project.PathWithNamespace, model, label, config.debugMode); err != nil {
 					config.dbErrorCount.Add(1)
 					if config.debugMode {
-						fmt.Printf("  [DB] Warning: Failed to save PR comment for %s/%s#%d: %v\n", pr.Owner, pr.Repo, prNumber, err)
+						fmt.Printf("  [DB] Warning: Failed to save GitLab MR %s!%d: %v\n", project.PathWithNamespace, item.IID, err)
+					}
+				}
+				if err := persistGitLabNotes(db, project.PathWithNamespace, "mr", int(item.IID), notes); err != nil {
+					config.dbErrorCount.Add(1)
+					if config.debugMode {
+						fmt.Printf("  [DB] Warning: Failed to save GitLab MR notes %s!%d: %v\n", project.PathWithNamespace, item.IID, err)
 					}
 				}
 			}
+
+			mrNotesByKey[buildGitLabMergeRequestKey(project.PathWithNamespace, model.Number)] = notes
+
+			activities = append(activities, PRActivity{
+				Label:     label,
+				Owner:     project.PathWithNamespace,
+				Repo:      "",
+				MR:        model,
+				UpdatedAt: model.UpdatedAt,
+			})
+		}
+
+		projectIssues, err := listGitLabProjectIssues(ctx, client, project.ID, cutoff)
+		if err != nil {
+			return nil, nil, fmt.Errorf("list issues for %s: %w", project.PathWithNamespace, err)
+		}
+
+		for _, item := range projectIssues {
+			key := buildGitLabDedupKey(project.PathWithNamespace, "issue", item.IID)
+			if _, exists := seenIssues[key]; exists {
+				continue
+			}
+			seenIssues[key] = struct{}{}
+
+			model := toIssueModelFromGitLab(item)
+			if model.UpdatedAt.IsZero() || model.UpdatedAt.Before(cutoff) {
+				continue
+			}
+
+			label, notes, err := deriveGitLabIssueLabel(ctx, client, project.ID, item, currentUsername, currentUserID)
+			if err != nil {
+				return nil, nil, fmt.Errorf("derive issue label for %s#%d: %w", project.PathWithNamespace, item.IID, err)
+			}
+
+			if db != nil {
+				if err := db.SaveGitLabIssueWithLabel(project.PathWithNamespace, model, label, config.debugMode); err != nil {
+					config.dbErrorCount.Add(1)
+					if config.debugMode {
+						fmt.Printf("  [DB] Warning: Failed to save GitLab issue %s#%d: %v\n", project.PathWithNamespace, item.IID, err)
+					}
+				}
+				if err := persistGitLabNotes(db, project.PathWithNamespace, "issue", int(item.IID), notes); err != nil {
+					config.dbErrorCount.Add(1)
+					if config.debugMode {
+						fmt.Printf("  [DB] Warning: Failed to save GitLab issue notes %s#%d: %v\n", project.PathWithNamespace, item.IID, err)
+					}
+				}
+			}
+
+			issueActivities = append(issueActivities, IssueActivity{
+				Label:     label,
+				Owner:     project.PathWithNamespace,
+				Repo:      "",
+				Issue:     model,
+				UpdatedAt: model.UpdatedAt,
+			})
 		}
 	}
 
-	if err == nil {
-		for _, comment := range prComments {
-			if mentionsNumber(comment.GetBody(), issueNumber, pr.Owner, pr.Repo) {
-				return true
+	activities, issueActivities, err = linkGitLabCrossReferencesOnline(ctx, client, activities, issueActivities, projectIDByPath, mrNotesByKey, db)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	return activities, issueActivities, nil
+}
+
+func deriveGitLabMergeRequestLabel(
+	ctx context.Context,
+	client *gitlab.Client,
+	projectID int64,
+	item *gitlab.BasicMergeRequest,
+	currentUsername string,
+	currentUserID int64,
+) (string, []*gitlab.Note, error) {
+	if item == nil {
+		return "Involved", nil, nil
+	}
+
+	currentLabel := ""
+	if matchesGitLabBasicUser(item.Author, currentUsername, currentUserID) {
+		currentLabel = mergeLabelWithPriority(currentLabel, "Authored", true)
+	}
+	if gitLabBasicUserListContains(item.Assignees, currentUsername, currentUserID) || matchesGitLabBasicUser(item.Assignee, currentUsername, currentUserID) {
+		currentLabel = mergeLabelWithPriority(currentLabel, "Assigned", true)
+	}
+
+	if currentLabel == "Authored" || currentLabel == "Assigned" {
+		return currentLabel, nil, nil
+	}
+
+	var approvalState *gitlab.MergeRequestApprovalState
+	err := retryWithBackoff(func() error {
+		var apiErr error
+		approvalState, _, apiErr = client.MergeRequestApprovals.GetApprovalState(projectID, item.IID, gitlab.WithContext(ctx))
+		return apiErr
+	}, fmt.Sprintf("GitLabGetApprovalState %d!%d", projectID, item.IID))
+	if err != nil {
+		return "", nil, err
+	}
+	if gitLabApprovalStateReviewedByCurrentUser(approvalState, currentUsername, currentUserID) {
+		currentLabel = mergeLabelWithPriority(currentLabel, "Reviewed", true)
+	}
+
+	if gitLabBasicUserListContains(item.Reviewers, currentUsername, currentUserID) {
+		currentLabel = mergeLabelWithPriority(currentLabel, "Review Requested", true)
+	}
+
+	if !needsLowerPriorityPRChecks(currentLabel) {
+		if currentLabel == "" {
+			return "Involved", nil, nil
+		}
+		return currentLabel, nil, nil
+	}
+
+	notes, err := listAllGitLabMergeRequestNotes(ctx, client, projectID, item.IID)
+	if err != nil {
+		return "", nil, err
+	}
+
+	commented, mentioned := gitLabNotesInvolvement(notes, item.Description, currentUsername, currentUserID)
+	if commented {
+		currentLabel = mergeLabelWithPriority(currentLabel, "Commented", true)
+	}
+	if mentioned {
+		currentLabel = mergeLabelWithPriority(currentLabel, "Mentioned", true)
+	}
+
+	if currentLabel == "" {
+		return "Involved", notes, nil
+	}
+	return currentLabel, notes, nil
+}
+
+func deriveGitLabIssueLabel(
+	ctx context.Context,
+	client *gitlab.Client,
+	projectID int64,
+	item *gitlab.Issue,
+	currentUsername string,
+	currentUserID int64,
+) (string, []*gitlab.Note, error) {
+	if item == nil {
+		return "Involved", nil, nil
+	}
+
+	currentLabel := ""
+	if matchesGitLabIssueAuthor(item.Author, currentUsername, currentUserID) {
+		currentLabel = mergeLabelWithPriority(currentLabel, "Authored", false)
+	}
+	if gitLabIssueAssigneeListContains(item.Assignees, currentUsername, currentUserID) || matchesGitLabIssueAssignee(item.Assignee, currentUsername, currentUserID) {
+		currentLabel = mergeLabelWithPriority(currentLabel, "Assigned", false)
+	}
+
+	if currentLabel == "Authored" || currentLabel == "Assigned" {
+		return currentLabel, nil, nil
+	}
+
+	notes, err := listAllGitLabIssueNotes(ctx, client, projectID, item.IID)
+	if err != nil {
+		return "", nil, err
+	}
+
+	commented, mentioned := gitLabNotesInvolvement(notes, item.Description, currentUsername, currentUserID)
+	if commented {
+		currentLabel = mergeLabelWithPriority(currentLabel, "Commented", false)
+	}
+	if mentioned {
+		currentLabel = mergeLabelWithPriority(currentLabel, "Mentioned", false)
+	}
+
+	if currentLabel == "" {
+		return "Involved", notes, nil
+	}
+	return currentLabel, notes, nil
+}
+
+func persistGitLabNotes(db *Database, projectPath, itemType string, itemIID int, notes []*gitlab.Note) error {
+	if db == nil || len(notes) == 0 {
+		return nil
+	}
+
+	for _, note := range notes {
+		if note == nil {
+			continue
+		}
+
+		authorUsername := ""
+		authorID := int64(0)
+		author := note.Author
+		authorUsername = strings.TrimSpace(author.Username)
+		authorID = author.ID
+
+		record := GitLabNoteRecord{
+			ProjectPath:    projectPath,
+			ItemType:       itemType,
+			ItemIID:        itemIID,
+			NoteID:         int64(note.ID),
+			Body:           note.Body,
+			AuthorUsername: authorUsername,
+			AuthorID:       authorID,
+		}
+
+		if err := db.SaveGitLabNote(record, config.debugMode); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+func loadGitLabCachedActivities(cutoff time.Time) ([]PRActivity, []IssueActivity, error) {
+	if config.db == nil {
+		return []PRActivity{}, []IssueActivity{}, nil
+	}
+
+	allMRs, mrLabels, err := config.db.GetAllGitLabMergeRequestsWithLabels(config.debugMode)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	activities := make([]PRActivity, 0, len(allMRs))
+	for key, mr := range allMRs {
+		if mr.UpdatedAt.IsZero() || mr.UpdatedAt.Before(cutoff) {
+			continue
+		}
+
+		projectPath, ok := parseGitLabMRProjectPath(key)
+		if !ok || !isGitLabProjectAllowed(projectPath) {
+			continue
+		}
+
+		activities = append(activities, PRActivity{
+			Label:     mrLabels[key],
+			Owner:     projectPath,
+			Repo:      "",
+			MR:        mr,
+			UpdatedAt: mr.UpdatedAt,
+		})
+	}
+
+	allIssues, issueLabels, err := config.db.GetAllGitLabIssuesWithLabels(config.debugMode)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	issueActivities := make([]IssueActivity, 0, len(allIssues))
+	for key, issue := range allIssues {
+		if issue.UpdatedAt.IsZero() || issue.UpdatedAt.Before(cutoff) {
+			continue
+		}
+
+		projectPath, ok := parseGitLabIssueProjectPath(key)
+		if !ok || !isGitLabProjectAllowed(projectPath) {
+			continue
+		}
+
+		issueActivities = append(issueActivities, IssueActivity{
+			Label:     issueLabels[key],
+			Owner:     projectPath,
+			Repo:      "",
+			Issue:     issue,
+			UpdatedAt: issue.UpdatedAt,
+		})
+	}
+
+	activities, issueActivities, err = linkGitLabCrossReferencesOffline(config.db, activities, issueActivities)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	return activities, issueActivities, nil
+}
+
+var (
+	gitLabIssueSameProjectRefPattern = regexp.MustCompile(`(?i)(?:^|[^a-z0-9_])#([0-9]+)\b`)
+	gitLabIssueQualifiedRefPattern   = regexp.MustCompile(`(?i)([a-z0-9_.-]+(?:/[a-z0-9_.-]+)+)#([0-9]+)\b`)
+	gitLabIssueURLRefPattern         = regexp.MustCompile(`(?i)https?://[^\s]+/([a-z0-9_.-]+(?:/[a-z0-9_.-]+)+)/-/issues/([0-9]+)\b`)
+	gitLabIssueRelativeURLRefPattern = regexp.MustCompile(`(?i)/-/issues/([0-9]+)\b`)
+)
+
+func linkGitLabCrossReferencesOnline(
+	ctx context.Context,
+	client *gitlab.Client,
+	activities []PRActivity,
+	issueActivities []IssueActivity,
+	projectIDByPath map[string]int64,
+	mrNotesByKey map[string][]*gitlab.Note,
+	db *Database,
+) ([]PRActivity, []IssueActivity, error) {
+	mrToIssueKeys := make(map[string]map[string]struct{}, len(activities))
+
+	for _, activity := range activities {
+		projectPath := normalizeProjectPathWithNamespace(activity.Owner)
+		projectID, ok := projectIDByPath[projectPath]
+		if !ok {
+			continue
+		}
+
+		mrKey := buildGitLabMergeRequestKey(projectPath, activity.MR.Number)
+		closedIssues, err := listGitLabIssuesClosedOnMergeRequest(ctx, client, projectID, int64(activity.MR.Number))
+		if err == nil {
+			resolvedKeys := make(map[string]struct{})
+			for _, item := range closedIssues {
+				issueKey, ok := gitLabIssueKeyFromIssue(item, projectPath)
+				if !ok {
+					continue
+				}
+				resolvedKeys[issueKey] = struct{}{}
 			}
+			if len(resolvedKeys) > 0 {
+				mrToIssueKeys[mrKey] = resolvedKeys
+			}
+			continue
+		}
+
+		fallbackKeys := gitLabIssueReferenceKeysFromText(activity.MR.Body, projectPath)
+		if len(fallbackKeys) == 0 {
+			notes := mrNotesByKey[mrKey]
+			if len(notes) == 0 {
+				notes, err = listAllGitLabMergeRequestNotes(ctx, client, projectID, int64(activity.MR.Number))
+				if err == nil {
+					mrNotesByKey[mrKey] = notes
+					if db != nil {
+						if persistErr := persistGitLabNotes(db, projectPath, "mr", activity.MR.Number, notes); persistErr != nil {
+							config.dbErrorCount.Add(1)
+							if config.debugMode {
+								fmt.Printf("  [DB] Warning: Failed to save GitLab MR notes %s!%d: %v\n", projectPath, activity.MR.Number, persistErr)
+							}
+						}
+					}
+				}
+			}
+
+			for _, note := range notes {
+				if note == nil {
+					continue
+				}
+				for issueKey := range gitLabIssueReferenceKeysFromText(note.Body, projectPath) {
+					fallbackKeys[issueKey] = struct{}{}
+				}
+			}
+		}
+
+		if len(fallbackKeys) > 0 {
+			mrToIssueKeys[mrKey] = fallbackKeys
+		}
+	}
+
+	nestedActivities := nestGitLabIssues(activities, issueActivities, mrToIssueKeys)
+	return nestedActivities, filterStandaloneGitLabIssues(nestedActivities, issueActivities), nil
+}
+
+func linkGitLabCrossReferencesOffline(db *Database, activities []PRActivity, issueActivities []IssueActivity) ([]PRActivity, []IssueActivity, error) {
+	mrToIssueKeys := make(map[string]map[string]struct{}, len(activities))
+
+	for _, activity := range activities {
+		projectPath := normalizeProjectPathWithNamespace(activity.Owner)
+		mrKey := buildGitLabMergeRequestKey(projectPath, activity.MR.Number)
+		linked := gitLabIssueReferenceKeysFromText(activity.MR.Body, projectPath)
+		if len(linked) == 0 && db != nil {
+			notes, err := db.GetGitLabNotes(projectPath, "mr", activity.MR.Number)
+			if err != nil {
+				return nil, nil, err
+			}
+			for _, note := range notes {
+				for issueKey := range gitLabIssueReferenceKeysFromText(note.Body, projectPath) {
+					linked[issueKey] = struct{}{}
+				}
+			}
+		}
+
+		if len(linked) > 0 {
+			mrToIssueKeys[mrKey] = linked
+		}
+	}
+
+	nestedActivities := nestGitLabIssues(activities, issueActivities, mrToIssueKeys)
+	return nestedActivities, filterStandaloneGitLabIssues(nestedActivities, issueActivities), nil
+}
+
+func listGitLabIssuesClosedOnMergeRequest(ctx context.Context, client *gitlab.Client, projectID int64, mergeRequestIID int64) ([]*gitlab.Issue, error) {
+	allIssues := make([]*gitlab.Issue, 0)
+	opts := &gitlab.GetIssuesClosedOnMergeOptions{ListOptions: gitlab.ListOptions{PerPage: 100, Page: 1}}
+
+	for {
+		issues, resp, err := client.MergeRequests.GetIssuesClosedOnMerge(projectID, mergeRequestIID, opts, gitlab.WithContext(ctx))
+		if err != nil {
+			return nil, err
+		}
+		allIssues = append(allIssues, issues...)
+		if resp == nil || resp.NextPage == 0 {
+			break
+		}
+		opts.Page = resp.NextPage
+	}
+
+	return allIssues, nil
+}
+
+func nestGitLabIssues(activities []PRActivity, issueActivities []IssueActivity, mrToIssueKeys map[string]map[string]struct{}) []PRActivity {
+	issueByKey := make(map[string]IssueActivity, len(issueActivities))
+	for _, issue := range issueActivities {
+		issueByKey[buildGitLabIssueKey(issue.Owner, issue.Issue.Number)] = issue
+	}
+
+	for i := range activities {
+		activities[i].Issues = nil
+		mrKey := buildGitLabMergeRequestKey(activities[i].Owner, activities[i].MR.Number)
+		linkedKeys := mrToIssueKeys[mrKey]
+		if len(linkedKeys) == 0 {
+			continue
+		}
+		for issueKey := range linkedKeys {
+			issue, ok := issueByKey[issueKey]
+			if !ok {
+				continue
+			}
+			activities[i].Issues = append(activities[i].Issues, issue)
+		}
+		sort.Slice(activities[i].Issues, func(a, b int) bool {
+			return activities[i].Issues[a].UpdatedAt.After(activities[i].Issues[b].UpdatedAt)
+		})
+	}
+
+	return activities
+}
+
+func filterStandaloneGitLabIssues(activities []PRActivity, issueActivities []IssueActivity) []IssueActivity {
+	linkedIssueKeys := make(map[string]struct{})
+	for _, activity := range activities {
+		for _, issue := range activity.Issues {
+			linkedIssueKeys[buildGitLabIssueKey(issue.Owner, issue.Issue.Number)] = struct{}{}
+		}
+	}
+
+	standalone := make([]IssueActivity, 0, len(issueActivities))
+	for _, issue := range issueActivities {
+		issueKey := buildGitLabIssueKey(issue.Owner, issue.Issue.Number)
+		if _, linked := linkedIssueKeys[issueKey]; linked {
+			continue
+		}
+		standalone = append(standalone, issue)
+	}
+
+	return standalone
+}
+
+func gitLabIssueReferenceKeysFromText(text, defaultProjectPath string) map[string]struct{} {
+	results := make(map[string]struct{})
+	if strings.TrimSpace(text) == "" {
+		return results
+	}
+
+	for _, match := range gitLabIssueURLRefPattern.FindAllStringSubmatch(text, -1) {
+		if len(match) < 3 {
+			continue
+		}
+		iid, ok := parsePositiveInt(match[2])
+		if !ok {
+			continue
+		}
+		results[buildGitLabIssueKey(match[1], iid)] = struct{}{}
+	}
+
+	for _, match := range gitLabIssueQualifiedRefPattern.FindAllStringSubmatch(text, -1) {
+		if len(match) < 3 {
+			continue
+		}
+		iid, ok := parsePositiveInt(match[2])
+		if !ok {
+			continue
+		}
+		results[buildGitLabIssueKey(match[1], iid)] = struct{}{}
+	}
+
+	defaultProjectPath = normalizeProjectPathWithNamespace(defaultProjectPath)
+	if defaultProjectPath != "" {
+		for _, match := range gitLabIssueRelativeURLRefPattern.FindAllStringSubmatch(text, -1) {
+			if len(match) < 2 {
+				continue
+			}
+			iid, ok := parsePositiveInt(match[1])
+			if !ok {
+				continue
+			}
+			results[buildGitLabIssueKey(defaultProjectPath, iid)] = struct{}{}
+		}
+
+		for _, match := range gitLabIssueSameProjectRefPattern.FindAllStringSubmatch(text, -1) {
+			if len(match) < 2 {
+				continue
+			}
+			iid, ok := parsePositiveInt(match[1])
+			if !ok {
+				continue
+			}
+			results[buildGitLabIssueKey(defaultProjectPath, iid)] = struct{}{}
+		}
+	}
+
+	return results
+}
+
+func gitLabIssueKeyFromIssue(item *gitlab.Issue, defaultProjectPath string) (string, bool) {
+	if item == nil || item.IID <= 0 {
+		return "", false
+	}
+
+	if item.References != nil {
+		if projectPath, iid, ok := parseGitLabQualifiedReference(item.References.Full); ok {
+			return buildGitLabIssueKey(projectPath, iid), true
+		}
+	}
+
+	defaultProjectPath = normalizeProjectPathWithNamespace(defaultProjectPath)
+	if defaultProjectPath == "" {
+		return "", false
+	}
+	return buildGitLabIssueKey(defaultProjectPath, int(item.IID)), true
+}
+
+func parseGitLabQualifiedReference(reference string) (string, int, bool) {
+	for _, match := range gitLabIssueQualifiedRefPattern.FindAllStringSubmatch(reference, -1) {
+		if len(match) < 3 {
+			continue
+		}
+		iid, ok := parsePositiveInt(match[2])
+		if !ok {
+			continue
+		}
+		return normalizeProjectPathWithNamespace(match[1]), iid, true
+	}
+	return "", 0, false
+}
+
+func parsePositiveInt(raw string) (int, bool) {
+	value, err := strconv.Atoi(strings.TrimSpace(raw))
+	if err != nil || value <= 0 {
+		return 0, false
+	}
+	return value, true
+}
+
+func parseGitLabMRProjectPath(key string) (string, bool) {
+	idx := strings.LastIndex(key, "#!")
+	if idx <= 0 {
+		return "", false
+	}
+	return key[:idx], true
+}
+
+func parseGitLabIssueProjectPath(key string) (string, bool) {
+	idx := strings.LastIndex(key, "##")
+	if idx <= 0 {
+		return "", false
+	}
+	return key[:idx], true
+}
+
+func isGitLabProjectAllowed(projectPath string) bool {
+	if config.allowedRepos == nil || len(config.allowedRepos) == 0 {
+		return true
+	}
+
+	normalized := normalizeProjectPathWithNamespace(projectPath)
+	for repo := range config.allowedRepos {
+		if strings.EqualFold(normalizeProjectPathWithNamespace(repo), normalized) {
+			return true
 		}
 	}
 
 	return false
 }
 
-func mentionsNumber(text string, number int, owner string, repo string) bool {
-	if text == "" {
+func needsLowerPriorityPRChecks(currentLabel string) bool {
+	return shouldUpdateLabel(currentLabel, "Commented", true) || shouldUpdateLabel(currentLabel, "Mentioned", true)
+}
+
+func mergeLabelWithPriority(currentLabel, candidateLabel string, isPR bool) string {
+	if shouldUpdateLabel(currentLabel, candidateLabel, isPR) {
+		return candidateLabel
+	}
+	return currentLabel
+}
+
+func listAllGitLabMergeRequestNotes(ctx context.Context, client *gitlab.Client, projectID int64, mrIID int64) ([]*gitlab.Note, error) {
+	allNotes := make([]*gitlab.Note, 0)
+	options := &gitlab.ListMergeRequestNotesOptions{
+		ListOptions: gitlab.ListOptions{PerPage: 100, Page: 1},
+	}
+
+	for {
+		var (
+			notes    []*gitlab.Note
+			response *gitlab.Response
+		)
+		err := retryWithBackoff(func() error {
+			var apiErr error
+			notes, response, apiErr = client.Notes.ListMergeRequestNotes(projectID, mrIID, options, gitlab.WithContext(ctx))
+			return apiErr
+		}, fmt.Sprintf("GitLabListMergeRequestNotes %d!%d page %d", projectID, mrIID, options.Page))
+		if err != nil {
+			return nil, err
+		}
+		allNotes = append(allNotes, notes...)
+
+		if response == nil || response.NextPage == 0 {
+			break
+		}
+		options.Page = response.NextPage
+	}
+
+	return allNotes, nil
+}
+
+func listAllGitLabIssueNotes(ctx context.Context, client *gitlab.Client, projectID int64, issueIID int64) ([]*gitlab.Note, error) {
+	allNotes := make([]*gitlab.Note, 0)
+	options := &gitlab.ListIssueNotesOptions{
+		ListOptions: gitlab.ListOptions{PerPage: 100, Page: 1},
+	}
+
+	for {
+		var (
+			notes    []*gitlab.Note
+			response *gitlab.Response
+		)
+		err := retryWithBackoff(func() error {
+			var apiErr error
+			notes, response, apiErr = client.Notes.ListIssueNotes(projectID, issueIID, options, gitlab.WithContext(ctx))
+			return apiErr
+		}, fmt.Sprintf("GitLabListIssueNotes %d#%d page %d", projectID, issueIID, options.Page))
+		if err != nil {
+			return nil, err
+		}
+		allNotes = append(allNotes, notes...)
+
+		if response == nil || response.NextPage == 0 {
+			break
+		}
+		options.Page = response.NextPage
+	}
+
+	return allNotes, nil
+}
+
+func gitLabNotesInvolvement(notes []*gitlab.Note, description, currentUsername string, currentUserID int64) (bool, bool) {
+	commented := false
+	mentioned := containsGitLabUserMention(description, currentUsername)
+
+	for _, note := range notes {
+		if note == nil {
+			continue
+		}
+		if matchesGitLabNoteAuthor(note.Author, currentUsername, currentUserID) {
+			commented = true
+		}
+		if !mentioned && containsGitLabUserMention(note.Body, currentUsername) {
+			mentioned = true
+		}
+		if commented && mentioned {
+			break
+		}
+	}
+
+	return commented, mentioned
+}
+
+func containsGitLabUserMention(text, username string) bool {
+	if text == "" || username == "" {
 		return false
 	}
-
-	lowerText := strings.ToLower(text)
-
-	urlPatterns := []string{
-		fmt.Sprintf("github.com/%s/%s/issues/%d", strings.ToLower(owner), strings.ToLower(repo), number),
-		fmt.Sprintf("github.com/%s/%s/pull/%d", strings.ToLower(owner), strings.ToLower(repo), number),
+	needle := "@" + strings.ToLower(strings.TrimSpace(username))
+	if needle == "@" {
+		return false
 	}
-	for _, pattern := range urlPatterns {
-		if strings.Contains(lowerText, pattern) {
+	return strings.Contains(strings.ToLower(text), needle)
+}
+
+func matchesGitLabNoteAuthor(author gitlab.NoteAuthor, username string, userID int64) bool {
+	if userID > 0 && author.ID == userID {
+		return true
+	}
+	return strings.EqualFold(strings.TrimSpace(author.Username), strings.TrimSpace(username))
+}
+
+func matchesGitLabBasicUser(user *gitlab.BasicUser, username string, userID int64) bool {
+	if user == nil {
+		return false
+	}
+	if userID > 0 && user.ID == userID {
+		return true
+	}
+	return strings.EqualFold(strings.TrimSpace(user.Username), strings.TrimSpace(username))
+}
+
+func matchesGitLabIssueAuthor(author *gitlab.IssueAuthor, username string, userID int64) bool {
+	if author == nil {
+		return false
+	}
+	if userID > 0 && author.ID == userID {
+		return true
+	}
+	return strings.EqualFold(strings.TrimSpace(author.Username), strings.TrimSpace(username))
+}
+
+func matchesGitLabIssueAssignee(assignee *gitlab.IssueAssignee, username string, userID int64) bool {
+	if assignee == nil {
+		return false
+	}
+	if userID > 0 && assignee.ID == userID {
+		return true
+	}
+	return strings.EqualFold(strings.TrimSpace(assignee.Username), strings.TrimSpace(username))
+}
+
+func gitLabIssueAssigneeListContains(assignees []*gitlab.IssueAssignee, username string, userID int64) bool {
+	for _, assignee := range assignees {
+		if matchesGitLabIssueAssignee(assignee, username, userID) {
 			return true
 		}
 	}
-
-	patterns := []string{
-		fmt.Sprintf("#%d", number),
-		fmt.Sprintf("fixes #%d", number),
-		fmt.Sprintf("closes #%d", number),
-		fmt.Sprintf("resolves #%d", number),
-		fmt.Sprintf("fixed #%d", number),
-		fmt.Sprintf("closed #%d", number),
-		fmt.Sprintf("resolved #%d", number),
-		fmt.Sprintf("fix #%d", number),
-		fmt.Sprintf("close #%d", number),
-		fmt.Sprintf("resolve #%d", number),
-	}
-
-	for _, pattern := range patterns {
-		if strings.Contains(lowerText, pattern) {
-			return true
-		}
-	}
-
 	return false
 }
 
-func collectSearchResults(query, label string, seenPRs *sync.Map, activitiesMap *sync.Map) {
-	if config.localMode {
-		if config.db == nil {
-			return
+func gitLabBasicUserListContains(users []*gitlab.BasicUser, username string, userID int64) bool {
+	for _, user := range users {
+		if matchesGitLabBasicUser(user, username, userID) {
+			return true
+		}
+	}
+	return false
+}
+
+func gitLabApprovalStateReviewedByCurrentUser(state *gitlab.MergeRequestApprovalState, username string, userID int64) bool {
+	if state == nil {
+		return false
+	}
+	for _, rule := range state.Rules {
+		if rule == nil {
+			continue
+		}
+		if gitLabBasicUserListContains(rule.ApprovedBy, username, userID) {
+			return true
+		}
+	}
+	return false
+}
+
+func resolveAllowedGitLabProjects(ctx context.Context, client *gitlab.Client, allowedRepos map[string]bool) ([]gitLabProject, error) {
+	if client == nil {
+		return nil, fmt.Errorf("gitlab client is not configured")
+	}
+
+	if len(allowedRepos) == 0 {
+		return []gitLabProject{}, nil
+	}
+
+	repoPaths := make([]string, 0, len(allowedRepos))
+	for repo := range allowedRepos {
+		normalized := normalizeProjectPathWithNamespace(repo)
+		if normalized != "" {
+			repoPaths = append(repoPaths, normalized)
+		}
+	}
+	sort.Strings(repoPaths)
+
+	projectIDCache := make(map[string]int64, len(repoPaths))
+	projects := make([]gitLabProject, 0, len(repoPaths))
+	for _, pathWithNamespace := range repoPaths {
+		if id, ok := projectIDCache[pathWithNamespace]; ok {
+			projects = append(projects, gitLabProject{PathWithNamespace: pathWithNamespace, ID: id})
+			continue
 		}
 
-		allPRs, prLabels, err := config.db.GetAllPullRequestsWithLabels(config.debugMode)
+		var project *gitlab.Project
+		err := retryWithBackoff(func() error {
+			var apiErr error
+			project, _, apiErr = client.Projects.GetProject(pathWithNamespace, nil, gitlab.WithContext(ctx))
+			return apiErr
+		}, fmt.Sprintf("GitLabGetProject %s", pathWithNamespace))
 		if err != nil {
-			if config.debugMode {
-				fmt.Printf("  [%s] Error loading from database: %v\n", label, err)
-			}
-			return
+			return nil, fmt.Errorf("resolve project %s: %w", pathWithNamespace, err)
 		}
 
-		if config.debugMode {
-			fmt.Printf("  [%s] Loading from database...\n", label)
-		}
-
-		totalFound := 0
-		cutoffTime := time.Now().Add(-config.timeRange)
-		for key, pr := range allPRs {
-			storedLabel := prLabels[key]
-
-			if storedLabel != label {
-				continue
-			}
-
-			if pr.GetUpdatedAt().Time.Before(cutoffTime) {
-				continue
-			}
-
-			parts := strings.Split(key, "/")
-			if len(parts) < 2 {
-				continue
-			}
-			owner := parts[0]
-			repoAndNum := parts[1]
-			repoParts := strings.Split(repoAndNum, "#")
-			if len(repoParts) < 2 {
-				continue
-			}
-			repo := repoParts[0]
-
-			if !isRepoAllowed(owner, repo) {
-				continue
-			}
-
-			prKey := key
-
-			// Check if we've already processed this PR in activitiesMap
-			existingActivity, alreadyProcessed := activitiesMap.Load(prKey)
-			shouldProcess := true
-
-			if alreadyProcessed {
-				existingPR := existingActivity.(*PRActivity)
-				if shouldUpdateLabel(existingPR.Label, label, true) {
-					// New label has higher priority, we'll update it
-					if config.debugMode {
-						fmt.Printf("  [%s] Updating label for %s from %s to %s (higher priority)\n", label, prKey, existingPR.Label, label)
-					}
-				} else {
-					// Existing label has higher or equal priority, skip
-					shouldProcess = false
-				}
-			}
-
-			if shouldProcess {
-				activity := PRActivity{
-					Label:     label,
-					Owner:     owner,
-					Repo:      repo,
-					PR:        pr,
-					UpdatedAt: pr.GetUpdatedAt().Time,
-				}
-				activitiesMap.Store(prKey, &activity)
-				totalFound++
-			}
-		}
-
-		if config.debugMode && totalFound > 0 {
-			fmt.Printf("  [%s] Complete: %d PRs found\n", label, totalFound)
-		}
-
-		return
+		projectIDCache[pathWithNamespace] = project.ID
+		projects = append(projects, gitLabProject{PathWithNamespace: pathWithNamespace, ID: project.ID})
 	}
 
-	opts := &github.SearchOptions{
-		ListOptions: github.ListOptions{PerPage: 100},
+	return projects, nil
+}
+
+func listGitLabProjectMergeRequests(ctx context.Context, client *gitlab.Client, projectID int64, cutoff time.Time) ([]*gitlab.BasicMergeRequest, error) {
+	allItems := make([]*gitlab.BasicMergeRequest, 0)
+	options := &gitlab.ListProjectMergeRequestsOptions{
+		ListOptions:  gitlab.ListOptions{PerPage: 100, Page: 1},
+		State:        gitlab.Ptr("all"),
+		UpdatedAfter: &cutoff,
 	}
 
-	totalFound := 0
-
-	page := 1
 	for {
-		if config.debugMode {
-			fmt.Printf("  [%s] Searching page %d with query: %s\n", label, page, query)
+		var (
+			items    []*gitlab.BasicMergeRequest
+			response *gitlab.Response
+		)
+		err := retryWithBackoff(func() error {
+			var apiErr error
+			items, response, apiErr = client.MergeRequests.ListProjectMergeRequests(projectID, options, gitlab.WithContext(ctx))
+			return apiErr
+		}, fmt.Sprintf("GitLabListProjectMergeRequests %d page %d", projectID, options.Page))
+		if err != nil {
+			return nil, err
 		}
+		allItems = append(allItems, items...)
 
-		var result *github.IssuesSearchResult
-		var resp *github.Response
-		var err error
-
-		retryErr := retryWithBackoff(func() error {
-			result, resp, err = config.client.Search.Issues(config.ctx, query, opts)
-			return err
-		}, fmt.Sprintf("%s-page%d", label, page))
-
-		config.progress.increment()
-		if !config.debugMode {
-			config.progress.display()
-		}
-
-		if page == 1 && resp != nil && resp.NextPage != 0 {
-			lastPage := resp.LastPage
-			if lastPage > 1 {
-				additionalPages := lastPage - 1
-				config.progress.addToTotal(additionalPages)
-				if !config.debugMode {
-					config.progress.display()
-				}
-			}
-		}
-
-		if retryErr != nil {
-			fmt.Printf("  [%s] Error searching after retries: %v\n", label, retryErr)
-			if resp != nil {
-				fmt.Printf("  [%s] Rate limit remaining: %d/%d\n", label, resp.Rate.Remaining, resp.Rate.Limit)
-			}
-			return
-		}
-
-		if config.debugMode && resp != nil {
-			fmt.Printf("  [%s] API Response: %d results, Rate: %d/%d\n", label, len(result.Issues), resp.Rate.Remaining, resp.Rate.Limit)
-		}
-
-		pageResults := 0
-		for _, issue := range result.Issues {
-			if issue.PullRequestLinks == nil {
-				continue
-			}
-
-			repoURL := *issue.RepositoryURL
-			parts := strings.Split(repoURL, "/")
-			if len(parts) < 2 {
-				fmt.Printf("  [%s] Error: Invalid repository URL format: %s\n", label, repoURL)
-				continue
-			}
-			owner := parts[len(parts)-2]
-			repo := parts[len(parts)-1]
-
-			if !isRepoAllowed(owner, repo) {
-				continue
-			}
-
-			prKey := buildItemKey(owner, repo, *issue.Number)
-
-			// Check if we've already processed this PR in activitiesMap
-			existingActivity, alreadyProcessed := activitiesMap.Load(prKey)
-			shouldProcess := true
-
-			if alreadyProcessed {
-				// PR is already in activitiesMap, check if we need to update the label
-				existingPR := existingActivity.(*PRActivity)
-				if shouldUpdateLabel(existingPR.Label, label, true) {
-					// New label has higher priority, we'll update it
-					if config.debugMode {
-						fmt.Printf("  [%s] Updating label for %s from %s to %s (higher priority)\n", label, prKey, existingPR.Label, label)
-					}
-				} else {
-					// Existing label has higher or equal priority, skip fetching again
-					shouldProcess = false
-				}
-			}
-
-			if shouldProcess {
-				// Store in seenPRs to prevent other goroutines from fetching the same PR
-				seenPRs.Store(prKey, label)
-				config.progress.addToTotal(1)
-				if !config.debugMode {
-					config.progress.display()
-				}
-
-				var pr *github.PullRequest
-				// var prErr error
-
-				config.progress.increment()
-				if !config.debugMode {
-					config.progress.display()
-				}
-
-				pr = &github.PullRequest{
-					Number:    issue.Number,
-					Title:     issue.Title,
-					Body:      issue.Body,
-					State:     issue.State,
-					UpdatedAt: issue.UpdatedAt,
-					User:      issue.User,
-					HTMLURL:   issue.HTMLURL,
-				}
-				// }
-
-				hasUpdates := false
-
-				if config.db != nil {
-					cachedPR, err := config.db.GetPullRequest(owner, repo, *issue.Number)
-					if err == nil {
-						if pr.GetUpdatedAt().After(cachedPR.GetUpdatedAt().Time) {
-							hasUpdates = true
-							if config.debugMode {
-								fmt.Printf("  [%s] Update detected: %s/%s#%d (API: %s > DB: %s)\n",
-									label, owner, repo, *issue.Number,
-									pr.GetUpdatedAt().Format("2006-01-02 15:04:05"),
-									cachedPR.GetUpdatedAt().Time.Format("2006-01-02 15:04:05"))
-							}
-						} else if config.debugMode {
-							fmt.Printf("  [%s] No update: %s/%s#%d (API: %s == DB: %s)\n",
-								label, owner, repo, *issue.Number,
-								pr.GetUpdatedAt().Format("2006-01-02 15:04:05"),
-								cachedPR.GetUpdatedAt().Time.Format("2006-01-02 15:04:05"))
-						}
-					} else {
-						// If there's no cached version, this is a new PR, so it has "updates"
-						hasUpdates = true
-						if config.debugMode {
-							fmt.Printf("  [%s] New PR (not in DB): %s/%s#%d\n",
-								label, owner, repo, *issue.Number)
-						}
-					}
-				}
-
-				// Determine the final label to use
-				finalLabel := label
-				if alreadyProcessed {
-					existingPR := existingActivity.(*PRActivity)
-					if !shouldUpdateLabel(existingPR.Label, label, true) {
-						// Keep the existing higher-priority label
-						finalLabel = existingPR.Label
-						if config.debugMode {
-							fmt.Printf("  [%s] Keeping existing label %s for %s (higher priority)\n", label, finalLabel, prKey)
-						}
-					}
-				}
-
-				if config.db != nil {
-					if err := config.db.SavePullRequestWithLabel(owner, repo, pr, finalLabel, config.debugMode); err != nil {
-						config.dbErrorCount.Add(1)
-						if config.debugMode {
-							fmt.Printf("  [DB] Warning: Failed to save PR %s/%s#%d: %v\n", owner, repo, pr.GetNumber(), err)
-						}
-					}
-				}
-
-				activity := PRActivity{
-					Label:      finalLabel,
-					Owner:      owner,
-					Repo:       repo,
-					PR:         pr,
-					UpdatedAt:  pr.GetUpdatedAt().Time,
-					HasUpdates: hasUpdates,
-				}
-				activitiesMap.Store(prKey, &activity)
-				pageResults++
-				totalFound++
-			}
-		}
-
-		if config.debugMode {
-			fmt.Printf("  [%s] Page %d: found %d new PRs (total: %d)\n", label, page, pageResults, totalFound)
-		}
-
-		if resp.NextPage == 0 {
+		if response == nil || response.NextPage == 0 {
 			break
 		}
-		opts.Page = resp.NextPage
-		page++
+		options.Page = response.NextPage
 	}
 
-	if config.debugMode && totalFound > 0 {
-		fmt.Printf("  [%s] Complete: %d PRs found\n", label, totalFound)
-	}
+	return allItems, nil
 }
 
-// DisplayConfig holds all the information needed to display a PR or issue
-type DisplayConfig struct {
-	Owner      string
-	Repo       string
-	Number     int
-	Title      string
-	User       string
-	UpdatedAt  *github.Timestamp
-	HTMLURL    *string
-	Label      string
-	HasUpdates bool
-	IsIndented bool   // for nested display under PRs
-	State      *string // for issues nested under PRs (OPEN/CLOSED)
-}
-
-// displayItem is the unified display function for both PRs and issues
-func displayItem(cfg DisplayConfig) {
-	dateStr := "          "
-	if cfg.UpdatedAt != nil {
-		dateStr = cfg.UpdatedAt.Format("2006/01/02")
+func listGitLabProjectIssues(ctx context.Context, client *gitlab.Client, projectID int64, cutoff time.Time) ([]*gitlab.Issue, error) {
+	allItems := make([]*gitlab.Issue, 0)
+	options := &gitlab.ListProjectIssuesOptions{
+		ListOptions:  gitlab.ListOptions{PerPage: 100, Page: 1},
+		State:        gitlab.Ptr("all"),
+		UpdatedAfter: &cutoff,
 	}
 
-	indent := ""
-	linkIndent := "   "
-	if cfg.IsIndented && cfg.State != nil {
-		state := strings.ToUpper(*cfg.State)
-		stateColor := getStateColor(*cfg.State)
-		indent = fmt.Sprintf("-- %s ", stateColor.Sprint(state))
-		linkIndent = "      "
-	}
-
-	labelColor := getLabelColor(cfg.Label)
-	userColor := getUserColor(cfg.User)
-
-	updateIcon := ""
-	if cfg.HasUpdates {
-		updateIcon = color.New(color.FgYellow, color.Bold).Sprint("● ")
-	}
-
-	fmt.Printf("%s%s%s %s %s %s/%s#%d - %s\n",
-		updateIcon,
-		indent,
-		dateStr,
-		labelColor.Sprint(strings.ToUpper(cfg.Label)),
-		userColor.Sprint(cfg.User),
-		cfg.Owner, cfg.Repo, cfg.Number,
-		cfg.Title,
-	)
-
-	if config.showLinks && cfg.HTMLURL != nil {
-		fmt.Printf("%s🔗 %s\n", linkIndent, *cfg.HTMLURL)
-	}
-}
-
-func displayPR(label, owner, repo string, pr *github.PullRequest, hasUpdates bool) {
-	displayItem(DisplayConfig{
-		Owner:      owner,
-		Repo:       repo,
-		Number:     pr.GetNumber(),
-		Title:      pr.GetTitle(),
-		User:       pr.User.GetLogin(),
-		UpdatedAt:  pr.UpdatedAt,
-		HTMLURL:    pr.HTMLURL,
-		Label:      label,
-		HasUpdates: hasUpdates,
-		IsIndented: false,
-	})
-}
-
-func displayIssue(label, owner, repo string, issue *github.Issue, indented bool, hasUpdates bool) {
-	displayItem(DisplayConfig{
-		Owner:      owner,
-		Repo:       repo,
-		Number:     issue.GetNumber(),
-		Title:      issue.GetTitle(),
-		User:       issue.User.GetLogin(),
-		UpdatedAt:  issue.UpdatedAt,
-		HTMLURL:    issue.HTMLURL,
-		Label:      label,
-		HasUpdates: hasUpdates,
-		IsIndented: indented,
-		State:      issue.State,
-	})
-}
-
-func collectIssueSearchResults(query, label string, seenIssues *sync.Map, issueActivitiesMap *sync.Map) {
-	if config.localMode {
-		if config.db == nil {
-			return
-		}
-
-		allIssues, issueLabels, err := config.db.GetAllIssuesWithLabels(config.debugMode)
-		if err != nil {
-			if config.debugMode {
-				fmt.Printf("  [%s] Error loading from database: %v\n", label, err)
-			}
-			return
-		}
-
-		if config.debugMode {
-			fmt.Printf("  [%s] Loading from database...\n", label)
-		}
-
-		totalFound := 0
-		cutoffTime := time.Now().Add(-config.timeRange)
-		for key, issue := range allIssues {
-			storedLabel := issueLabels[key]
-
-			if storedLabel != label {
-				continue
-			}
-
-			if issue.GetUpdatedAt().Time.Before(cutoffTime) {
-				continue
-			}
-
-			parts := strings.Split(key, "/")
-			if len(parts) < 2 {
-				continue
-			}
-			owner := parts[0]
-			repoAndNum := parts[1]
-			repoParts := strings.Split(repoAndNum, "#")
-			if len(repoParts) < 2 {
-				continue
-			}
-			repo := repoParts[0]
-
-			if !isRepoAllowed(owner, repo) {
-				continue
-			}
-
-			issueKey := key
-
-			// Check if we've already processed this issue in issueActivitiesMap
-			existingActivity, alreadyProcessed := issueActivitiesMap.Load(issueKey)
-			shouldProcess := true
-
-			if alreadyProcessed {
-				// Issue is already in issueActivitiesMap, check if we need to update the label
-				existingIssue := existingActivity.(*IssueActivity)
-				if shouldUpdateLabel(existingIssue.Label, label, false) {
-					// New label has higher priority, we'll update it
-					if config.debugMode {
-						fmt.Printf("  [%s] Updating label for %s from %s to %s (higher priority)\n", label, issueKey, existingIssue.Label, label)
-					}
-				} else {
-					// Existing label has higher or equal priority, skip
-					shouldProcess = false
-				}
-			}
-
-			if shouldProcess {
-				activity := IssueActivity{
-					Label:     label,
-					Owner:     owner,
-					Repo:      repo,
-					Issue:     issue,
-					UpdatedAt: issue.GetUpdatedAt().Time,
-				}
-				issueActivitiesMap.Store(issueKey, &activity)
-				totalFound++
-			}
-		}
-
-		if config.debugMode && totalFound > 0 {
-			fmt.Printf("  [%s] Complete: %d issues found\n", label, totalFound)
-		}
-
-		return
-	}
-
-	opts := &github.SearchOptions{
-		ListOptions: github.ListOptions{PerPage: 100},
-	}
-
-	totalFound := 0
-
-	page := 1
 	for {
-		if config.debugMode {
-			fmt.Printf("  [%s] Searching page %d with query: %s\n", label, page, query)
+		var (
+			items    []*gitlab.Issue
+			response *gitlab.Response
+		)
+		err := retryWithBackoff(func() error {
+			var apiErr error
+			items, response, apiErr = client.Issues.ListProjectIssues(projectID, options, gitlab.WithContext(ctx))
+			return apiErr
+		}, fmt.Sprintf("GitLabListProjectIssues %d page %d", projectID, options.Page))
+		if err != nil {
+			return nil, err
 		}
+		allItems = append(allItems, items...)
 
-		var result *github.IssuesSearchResult
-		var resp *github.Response
-		var err error
-
-		retryErr := retryWithBackoff(func() error {
-			result, resp, err = config.client.Search.Issues(config.ctx, query, opts)
-			return err
-		}, fmt.Sprintf("%s-issues-page%d", label, page))
-
-		config.progress.increment()
-		if !config.debugMode {
-			config.progress.display()
-		}
-
-		if page == 1 && resp != nil && resp.NextPage != 0 {
-			lastPage := resp.LastPage
-			if lastPage > 1 {
-				additionalPages := lastPage - 1
-				config.progress.addToTotal(additionalPages)
-				if !config.debugMode {
-					config.progress.display()
-				}
-			}
-		}
-
-		if retryErr != nil {
-			fmt.Printf("  [%s] Error searching after retries: %v\n", label, retryErr)
-			if resp != nil {
-				fmt.Printf("  [%s] Rate limit remaining: %d/%d\n", label, resp.Rate.Remaining, resp.Rate.Limit)
-			}
-			return
-		}
-
-		if config.debugMode && resp != nil {
-			fmt.Printf("  [%s] API Response: %d results, Rate: %d/%d\n", label, len(result.Issues), resp.Rate.Remaining, resp.Rate.Limit)
-		}
-
-		pageResults := 0
-		for _, issue := range result.Issues {
-			if issue.PullRequestLinks != nil {
-				continue
-			}
-
-			repoURL := *issue.RepositoryURL
-			parts := strings.Split(repoURL, "/")
-			if len(parts) < 2 {
-				fmt.Printf("  [%s] Error: Invalid repository URL format: %s\n", label, repoURL)
-				continue
-			}
-			owner := parts[len(parts)-2]
-			repo := parts[len(parts)-1]
-
-			if !isRepoAllowed(owner, repo) {
-				continue
-			}
-
-			issueKey := buildItemKey(owner, repo, *issue.Number)
-
-			// Check if we've already processed this issue in issueActivitiesMap
-			existingActivity, alreadyProcessed := issueActivitiesMap.Load(issueKey)
-			shouldProcess := true
-
-			if alreadyProcessed {
-				// Issue is already in issueActivitiesMap, check if we need to update the label
-				existingIssue := existingActivity.(*IssueActivity)
-				if shouldUpdateLabel(existingIssue.Label, label, false) {
-					// New label has higher priority, we'll update it
-					if config.debugMode {
-						fmt.Printf("  [%s] Updating label for %s from %s to %s (higher priority)\n", label, issueKey, existingIssue.Label, label)
-					}
-				} else {
-					// Existing label has higher or equal priority, skip
-					shouldProcess = false
-				}
-			}
-
-			if shouldProcess {
-				hasUpdates := false
-
-				if config.db != nil {
-					cachedIssue, err := config.db.GetIssue(owner, repo, *issue.Number)
-					if err == nil {
-						if issue.GetUpdatedAt().After(cachedIssue.GetUpdatedAt().Time) {
-							hasUpdates = true
-						}
-					}
-					if err := config.db.SaveIssueWithLabel(owner, repo, issue, label, config.debugMode); err != nil {
-						config.dbErrorCount.Add(1)
-						if config.debugMode {
-							fmt.Printf("  [DB] Warning: Failed to save issue %s/%s#%d: %v\n", owner, repo, *issue.Number, err)
-						}
-					}
-				}
-
-				activity := IssueActivity{
-					Label:      label,
-					Owner:      owner,
-					Repo:       repo,
-					Issue:      issue,
-					UpdatedAt:  issue.GetUpdatedAt().Time,
-					HasUpdates: hasUpdates,
-				}
-				issueActivitiesMap.Store(issueKey, &activity)
-				pageResults++
-				totalFound++
-			}
-		}
-
-		if config.debugMode {
-			fmt.Printf("  [%s] Page %d: found %d new issues (total: %d)\n", label, page, pageResults, totalFound)
-		}
-
-		if resp.NextPage == 0 {
+		if response == nil || response.NextPage == 0 {
 			break
 		}
-		opts.Page = resp.NextPage
-		page++
+		options.Page = response.NextPage
 	}
 
-	if config.debugMode && totalFound > 0 {
-		fmt.Printf("  [%s] Complete: %d issues found\n", label, totalFound)
+	return allItems, nil
+}
+
+func normalizeProjectPathWithNamespace(repo string) string {
+	trimmed := strings.TrimSpace(repo)
+	return strings.Trim(trimmed, "/")
+}
+
+func buildGitLabDedupKey(projectPath, itemType string, iid int64) string {
+	return fmt.Sprintf("%s|%s|%d", strings.ToLower(projectPath), itemType, iid)
+}
+
+func toMergeRequestModelFromGitLab(item *gitlab.BasicMergeRequest) MergeRequestModel {
+	if item == nil {
+		return MergeRequestModel{}
+	}
+
+	state := strings.ToLower(item.State)
+	merged := state == "merged" || item.MergedAt != nil
+	normalizedState := "open"
+	if merged || state == "closed" {
+		normalizedState = "closed"
+	}
+
+	updatedAt := time.Time{}
+	if item.UpdatedAt != nil {
+		updatedAt = *item.UpdatedAt
+	}
+
+	userLogin := ""
+	if item.Author != nil {
+		userLogin = item.Author.Username
+	}
+
+	return MergeRequestModel{
+		Number:    int(item.IID),
+		Title:     item.Title,
+		Body:      item.Description,
+		State:     normalizedState,
+		UpdatedAt: updatedAt,
+		WebURL:    item.WebURL,
+		UserLogin: userLogin,
+		Merged:    merged,
+	}
+}
+
+func toIssueModelFromGitLab(item *gitlab.Issue) IssueModel {
+	if item == nil {
+		return IssueModel{}
+	}
+
+	state := strings.ToLower(item.State)
+	normalizedState := "open"
+	if state == "closed" {
+		normalizedState = "closed"
+	}
+
+	updatedAt := time.Time{}
+	if item.UpdatedAt != nil {
+		updatedAt = *item.UpdatedAt
+	}
+
+	userLogin := ""
+	if item.Author != nil {
+		userLogin = item.Author.Username
+	}
+
+	return IssueModel{
+		Number:    int(item.IID),
+		Title:     item.Title,
+		Body:      item.Description,
+		State:     normalizedState,
+		UpdatedAt: updatedAt,
+		WebURL:    item.WebURL,
+		UserLogin: userLogin,
 	}
 }

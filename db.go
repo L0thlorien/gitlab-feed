@@ -7,31 +7,37 @@ import (
 	"strings"
 	"time"
 
-	"github.com/google/go-github/v57/github"
 	bolt "go.etcd.io/bbolt"
 )
 
 var (
-	pullRequestsBucket = []byte("pull_requests")
-	issuesBucket       = []byte("issues")
-	commentsBucket     = []byte("comments")
+	gitlabMergeRequestsBkt = []byte("gitlab_merge_requests")
+	gitlabIssuesBkt        = []byte("gitlab_issues")
+	gitlabNotesBkt         = []byte("gitlab_notes")
 )
 
 type Database struct {
 	db *bolt.DB
 }
 
-// buildItemKey creates a consistent key format for PRs and issues
-func buildItemKey(owner, repo string, number int) string {
-	return fmt.Sprintf("%s/%s#%d", owner, repo, number)
+func buildGitLabMergeRequestKey(pathWithNamespace string, iid int) string {
+	return fmt.Sprintf("%s#!%d", normalizeProjectPathWithNamespace(pathWithNamespace), iid)
 }
 
-// buildCommentKey creates a consistent key format for comments
-func buildCommentKey(owner, repo string, itemNumber int, commentType string, commentID int64) string {
-	return fmt.Sprintf("%s/%s#%d/%s/%d", owner, repo, itemNumber, commentType, commentID)
+func buildGitLabIssueKey(pathWithNamespace string, iid int) string {
+	return fmt.Sprintf("%s##%d", normalizeProjectPathWithNamespace(pathWithNamespace), iid)
 }
 
-// save is a generic function to save data to a bucket with consistent error handling and logging
+func buildGitLabNoteKey(pathWithNamespace, itemType string, iid int, noteID int64) string {
+	return fmt.Sprintf(
+		"%s|%s|%d|%d",
+		normalizeProjectPathWithNamespace(pathWithNamespace),
+		strings.ToLower(strings.TrimSpace(itemType)),
+		iid,
+		noteID,
+	)
+}
+
 func (d *Database) save(bucket []byte, key string, data interface{}, debugMode bool, itemType string) error {
 	jsonData, err := json.Marshal(data)
 	if err != nil {
@@ -45,16 +51,17 @@ func (d *Database) save(bucket []byte, key string, data interface{}, debugMode b
 		b := tx.Bucket(bucket)
 		return b.Put([]byte(key), jsonData)
 	})
-
 	if err != nil {
 		if debugMode {
 			fmt.Printf("  [DB] Error saving %s %s: %v\n", itemType, key, err)
 		}
-	} else if debugMode {
-		fmt.Printf("  [DB] Saved %s %s\n", itemType, key)
+		return err
 	}
 
-	return err
+	if debugMode {
+		fmt.Printf("  [DB] Saved %s %s\n", itemType, key)
+	}
+	return nil
 }
 
 func OpenDatabase(path string) (*Database, error) {
@@ -64,12 +71,12 @@ func OpenDatabase(path string) (*Database, error) {
 	}
 
 	if err := os.Chmod(path, 0666); err != nil {
-		db.Close()
+		_ = db.Close()
 		return nil, fmt.Errorf("failed to set database permissions: %w", err)
 	}
 
 	err = db.Update(func(tx *bolt.Tx) error {
-		buckets := [][]byte{pullRequestsBucket, issuesBucket, commentsBucket}
+		buckets := [][]byte{gitlabMergeRequestsBkt, gitlabIssuesBkt, gitlabNotesBkt}
 		for _, bucket := range buckets {
 			_, err := tx.CreateBucketIfNotExists(bucket)
 			if err != nil {
@@ -78,9 +85,8 @@ func OpenDatabase(path string) (*Database, error) {
 		}
 		return nil
 	})
-
 	if err != nil {
-		db.Close()
+		_ = db.Close()
 		return nil, err
 	}
 
@@ -91,451 +97,167 @@ func (d *Database) Close() error {
 	return d.db.Close()
 }
 
-type PRWithLabel struct {
-	PR    *github.PullRequest
+type GitLabMRWithLabel struct {
+	MR    MergeRequestModel
 	Label string
 }
 
-func (d *Database) SavePullRequest(owner, repo string, pr *github.PullRequest, debugMode bool) error {
-	key := buildItemKey(owner, repo, pr.GetNumber())
-	return d.save(pullRequestsBucket, key, pr, debugMode, "PR")
-}
-
-func (d *Database) SavePullRequestWithLabel(owner, repo string, pr *github.PullRequest, label string, debugMode bool) error {
-	key := buildItemKey(owner, repo, pr.GetNumber())
-	prWithLabel := PRWithLabel{
-		PR:    pr,
-		Label: label,
-	}
-	return d.save(pullRequestsBucket, key, prWithLabel, debugMode, fmt.Sprintf("PR with label %s", label))
-}
-
-func (d *Database) GetPullRequest(owner, repo string, number int) (*github.PullRequest, error) {
-	key := buildItemKey(owner, repo, number)
-
-	var pr github.PullRequest
-	err := d.db.View(func(tx *bolt.Tx) error {
-		b := tx.Bucket(pullRequestsBucket)
-		data := b.Get([]byte(key))
-		if data == nil {
-			return fmt.Errorf("PR not found")
-		}
-
-		var prWithLabel PRWithLabel
-		if err := json.Unmarshal(data, &prWithLabel); err == nil && prWithLabel.PR != nil {
-			pr = *prWithLabel.PR
-			return nil
-		}
-
-		return json.Unmarshal(data, &pr)
-	})
-
-	if err != nil {
-		return nil, err
-	}
-	return &pr, nil
-}
-
-func (d *Database) GetPullRequestWithLabel(owner, repo string, number int) (*github.PullRequest, string, error) {
-	key := buildItemKey(owner, repo, number)
-
-	var pr *github.PullRequest
-	var label string
-
-	err := d.db.View(func(tx *bolt.Tx) error {
-		b := tx.Bucket(pullRequestsBucket)
-		data := b.Get([]byte(key))
-		if data == nil {
-			return fmt.Errorf("PR not found")
-		}
-
-		var prWithLabel PRWithLabel
-		if err := json.Unmarshal(data, &prWithLabel); err == nil && prWithLabel.PR != nil {
-			pr = prWithLabel.PR
-			label = prWithLabel.Label
-			return nil
-		}
-
-		var oldPR github.PullRequest
-		if err := json.Unmarshal(data, &oldPR); err != nil {
-			return err
-		}
-		pr = &oldPR
-		label = ""
-		return nil
-	})
-
-	if err != nil {
-		return nil, "", err
-	}
-	return pr, label, nil
-}
-
-type IssueWithLabel struct {
-	Issue *github.Issue
+type GitLabIssueWithLabel struct {
+	Issue IssueModel
 	Label string
 }
 
-func (d *Database) SaveIssue(owner, repo string, issue *github.Issue, debugMode bool) error {
-	key := buildItemKey(owner, repo, issue.GetNumber())
-	return d.save(issuesBucket, key, issue, debugMode, "issue")
+type GitLabNoteRecord struct {
+	ProjectPath    string
+	ItemType       string
+	ItemIID        int
+	NoteID         int64
+	Body           string
+	AuthorUsername string
+	AuthorID       int64
 }
 
-func (d *Database) SaveIssueWithLabel(owner, repo string, issue *github.Issue, label string, debugMode bool) error {
-	key := buildItemKey(owner, repo, issue.GetNumber())
-	issueWithLabel := IssueWithLabel{
-		Issue: issue,
-		Label: label,
-	}
-	return d.save(issuesBucket, key, issueWithLabel, debugMode, fmt.Sprintf("issue with label %s", label))
+func (d *Database) SaveGitLabMergeRequestWithLabel(pathWithNamespace string, mr MergeRequestModel, label string, debugMode bool) error {
+	key := buildGitLabMergeRequestKey(pathWithNamespace, mr.Number)
+	item := GitLabMRWithLabel{MR: mr, Label: label}
+	return d.save(gitlabMergeRequestsBkt, key, item, debugMode, fmt.Sprintf("gitlab merge request with label %s", label))
 }
 
-func (d *Database) GetIssue(owner, repo string, number int) (*github.Issue, error) {
-	key := buildItemKey(owner, repo, number)
-
-	var issue github.Issue
-	err := d.db.View(func(tx *bolt.Tx) error {
-		b := tx.Bucket(issuesBucket)
-		data := b.Get([]byte(key))
-		if data == nil {
-			return fmt.Errorf("issue not found")
-		}
-
-		var issueWithLabel IssueWithLabel
-		if err := json.Unmarshal(data, &issueWithLabel); err == nil && issueWithLabel.Issue != nil {
-			issue = *issueWithLabel.Issue
-			return nil
-		}
-
-		return json.Unmarshal(data, &issue)
-	})
-
-	if err != nil {
-		return nil, err
-	}
-	return &issue, nil
+func (d *Database) SaveGitLabIssueWithLabel(pathWithNamespace string, issue IssueModel, label string, debugMode bool) error {
+	key := buildGitLabIssueKey(pathWithNamespace, issue.Number)
+	item := GitLabIssueWithLabel{Issue: issue, Label: label}
+	return d.save(gitlabIssuesBkt, key, item, debugMode, fmt.Sprintf("gitlab issue with label %s", label))
 }
 
-func (d *Database) GetIssueWithLabel(owner, repo string, number int) (*github.Issue, string, error) {
-	key := buildItemKey(owner, repo, number)
-
-	var issue *github.Issue
-	var label string
-
-	err := d.db.View(func(tx *bolt.Tx) error {
-		b := tx.Bucket(issuesBucket)
-		data := b.Get([]byte(key))
-		if data == nil {
-			return fmt.Errorf("issue not found")
-		}
-
-		var issueWithLabel IssueWithLabel
-		if err := json.Unmarshal(data, &issueWithLabel); err == nil && issueWithLabel.Issue != nil {
-			issue = issueWithLabel.Issue
-			label = issueWithLabel.Label
-			return nil
-		}
-
-		var oldIssue github.Issue
-		if err := json.Unmarshal(data, &oldIssue); err != nil {
-			return err
-		}
-		issue = &oldIssue
-		label = ""
-		return nil
-	})
-
-	if err != nil {
-		return nil, "", err
-	}
-	return issue, label, nil
+func (d *Database) SaveGitLabNote(note GitLabNoteRecord, debugMode bool) error {
+	key := buildGitLabNoteKey(note.ProjectPath, note.ItemType, note.ItemIID, note.NoteID)
+	return d.save(gitlabNotesBkt, key, note, debugMode, "gitlab note")
 }
 
-func (d *Database) SaveComment(owner, repo string, itemNumber int, comment *github.IssueComment, commentType string) error {
-	key := buildCommentKey(owner, repo, itemNumber, commentType, comment.GetID())
-
-	data, err := json.Marshal(comment)
-	if err != nil {
-		return fmt.Errorf("failed to marshal comment: %w", err)
-	}
-
-	return d.db.Update(func(tx *bolt.Tx) error {
-		b := tx.Bucket(commentsBucket)
-		return b.Put([]byte(key), data)
-	})
-}
-
-func (d *Database) SavePRComment(owner, repo string, prNumber int, comment *github.PullRequestComment, debugMode bool) error {
-	key := fmt.Sprintf("%s/%s#%d/pr_review_comment/%d", owner, repo, prNumber, comment.GetID())
-
-	data, err := json.Marshal(comment)
-	if err != nil {
-		if debugMode {
-			fmt.Printf("  [DB] Error marshaling PR comment %s: %v\n", key, err)
-		}
-		return fmt.Errorf("failed to marshal PR comment: %w", err)
-	}
-
-	err = d.db.Update(func(tx *bolt.Tx) error {
-		b := tx.Bucket(commentsBucket)
-		return b.Put([]byte(key), data)
-	})
-
-	if err != nil {
-		if debugMode {
-			fmt.Printf("  [DB] Error saving PR comment %s: %v\n", key, err)
-		}
-	} else if debugMode {
-		fmt.Printf("  [DB] Saved PR comment %s\n", key)
-	}
-
-	return err
-}
-
-func (d *Database) GetComment(owner, repo string, itemNumber int, commentType string, commentID int64) (*github.IssueComment, error) {
-	key := buildCommentKey(owner, repo, itemNumber, commentType, commentID)
-
-	var comment github.IssueComment
-	err := d.db.View(func(tx *bolt.Tx) error {
-		b := tx.Bucket(commentsBucket)
-		data := b.Get([]byte(key))
-		if data == nil {
-			return fmt.Errorf("comment not found")
-		}
-		return json.Unmarshal(data, &comment)
-	})
-
-	if err != nil {
-		return nil, err
-	}
-	return &comment, nil
-}
-
-func (d *Database) Stats() (prCount, issueCount, commentCount int, err error) {
-	err = d.db.View(func(tx *bolt.Tx) error {
-		prCount = tx.Bucket(pullRequestsBucket).Stats().KeyN
-		issueCount = tx.Bucket(issuesBucket).Stats().KeyN
-		commentCount = tx.Bucket(commentsBucket).Stats().KeyN
-		return nil
-	})
-	return
-}
-
-func (d *Database) GetAllPullRequests(debugMode bool) (map[string]*github.PullRequest, error) {
-	prs := make(map[string]*github.PullRequest)
-
-	if debugMode {
-		fmt.Printf("  [DB] Reading all PRs from database...\n")
-	}
-
-	err := d.db.View(func(tx *bolt.Tx) error {
-		b := tx.Bucket(pullRequestsBucket)
-		return b.ForEach(func(k, v []byte) error {
-			var prWithLabel PRWithLabel
-			if err := json.Unmarshal(v, &prWithLabel); err == nil && prWithLabel.PR != nil {
-				prs[string(k)] = prWithLabel.PR
-				return nil
-			}
-
-			var pr github.PullRequest
-			if err := json.Unmarshal(v, &pr); err != nil {
-				if debugMode {
-					fmt.Printf("  [DB] Error unmarshaling PR %s: %v\n", string(k), err)
-				}
-				return err
-			}
-			prs[string(k)] = &pr
-			return nil
-		})
-	})
-
-	if err != nil {
-		if debugMode {
-			fmt.Printf("  [DB] Error reading PRs: %v\n", err)
-		}
-		return nil, err
-	}
-
-	if debugMode {
-		fmt.Printf("  [DB] Loaded %d PRs from database\n", len(prs))
-	}
-
-	return prs, nil
-}
-
-func (d *Database) GetAllPullRequestsWithLabels(debugMode bool) (map[string]*github.PullRequest, map[string]string, error) {
-	prs := make(map[string]*github.PullRequest)
+func (d *Database) GetAllGitLabMergeRequestsWithLabels(debugMode bool) (map[string]MergeRequestModel, map[string]string, error) {
+	items := make(map[string]MergeRequestModel)
 	labels := make(map[string]string)
 
 	if debugMode {
-		fmt.Printf("  [DB] Reading all PRs with labels from database...\n")
+		fmt.Printf("  [DB] Reading all GitLab merge requests with labels from database...\n")
 	}
 
 	err := d.db.View(func(tx *bolt.Tx) error {
-		b := tx.Bucket(pullRequestsBucket)
+		b := tx.Bucket(gitlabMergeRequestsBkt)
 		return b.ForEach(func(k, v []byte) error {
 			key := string(k)
-
-			var prWithLabel PRWithLabel
-			if err := json.Unmarshal(v, &prWithLabel); err == nil && prWithLabel.PR != nil {
-				prs[key] = prWithLabel.PR
-				labels[key] = prWithLabel.Label
-				return nil
-			}
-
-			var pr github.PullRequest
-			if err := json.Unmarshal(v, &pr); err != nil {
+			var item GitLabMRWithLabel
+			if err := json.Unmarshal(v, &item); err != nil {
 				if debugMode {
-					fmt.Printf("  [DB] Error unmarshaling PR %s: %v\n", key, err)
+					fmt.Printf("  [DB] Error unmarshaling gitlab merge request %s: %v\n", key, err)
 				}
 				return err
 			}
-			prs[key] = &pr
-			labels[key] = "" // No label in old format
+			items[key] = item.MR
+			labels[key] = item.Label
 			return nil
 		})
 	})
-
 	if err != nil {
 		if debugMode {
-			fmt.Printf("  [DB] Error reading PRs: %v\n", err)
+			fmt.Printf("  [DB] Error reading GitLab merge requests: %v\n", err)
 		}
 		return nil, nil, err
 	}
 
 	if debugMode {
-		fmt.Printf("  [DB] Loaded %d PRs from database\n", len(prs))
+		fmt.Printf("  [DB] Loaded %d GitLab merge requests from database\n", len(items))
 	}
 
-	return prs, labels, nil
+	return items, labels, nil
 }
 
-func (d *Database) GetAllIssues(debugMode bool) (map[string]*github.Issue, error) {
-	issues := make(map[string]*github.Issue)
-
-	if debugMode {
-		fmt.Printf("  [DB] Reading all issues from database...\n")
-	}
-
-	err := d.db.View(func(tx *bolt.Tx) error {
-		b := tx.Bucket(issuesBucket)
-		return b.ForEach(func(k, v []byte) error {
-			var issueWithLabel IssueWithLabel
-			if err := json.Unmarshal(v, &issueWithLabel); err == nil && issueWithLabel.Issue != nil {
-				issues[string(k)] = issueWithLabel.Issue
-				return nil
-			}
-
-			var issue github.Issue
-			if err := json.Unmarshal(v, &issue); err != nil {
-				if debugMode {
-					fmt.Printf("  [DB] Error unmarshaling issue %s: %v\n", string(k), err)
-				}
-				return err
-			}
-			issues[string(k)] = &issue
-			return nil
-		})
-	})
-
-	if err != nil {
-		if debugMode {
-			fmt.Printf("  [DB] Error reading issues: %v\n", err)
-		}
-		return nil, err
-	}
-
-	if debugMode {
-		fmt.Printf("  [DB] Loaded %d issues from database\n", len(issues))
-	}
-
-	return issues, nil
-}
-
-func (d *Database) GetAllIssuesWithLabels(debugMode bool) (map[string]*github.Issue, map[string]string, error) {
-	issues := make(map[string]*github.Issue)
+func (d *Database) GetAllGitLabIssuesWithLabels(debugMode bool) (map[string]IssueModel, map[string]string, error) {
+	items := make(map[string]IssueModel)
 	labels := make(map[string]string)
 
 	if debugMode {
-		fmt.Printf("  [DB] Reading all issues with labels from database...\n")
+		fmt.Printf("  [DB] Reading all GitLab issues with labels from database...\n")
 	}
 
 	err := d.db.View(func(tx *bolt.Tx) error {
-		b := tx.Bucket(issuesBucket)
+		b := tx.Bucket(gitlabIssuesBkt)
 		return b.ForEach(func(k, v []byte) error {
 			key := string(k)
-
-			var issueWithLabel IssueWithLabel
-			if err := json.Unmarshal(v, &issueWithLabel); err == nil && issueWithLabel.Issue != nil {
-				issues[key] = issueWithLabel.Issue
-				labels[key] = issueWithLabel.Label
-				return nil
-			}
-
-			var issue github.Issue
-			if err := json.Unmarshal(v, &issue); err != nil {
+			var item GitLabIssueWithLabel
+			if err := json.Unmarshal(v, &item); err != nil {
 				if debugMode {
-					fmt.Printf("  [DB] Error unmarshaling issue %s: %v\n", key, err)
+					fmt.Printf("  [DB] Error unmarshaling gitlab issue %s: %v\n", key, err)
 				}
 				return err
 			}
-			issues[key] = &issue
-			labels[key] = "" // No label in old format
+			items[key] = item.Issue
+			labels[key] = item.Label
 			return nil
 		})
 	})
-
 	if err != nil {
 		if debugMode {
-			fmt.Printf("  [DB] Error reading issues: %v\n", err)
+			fmt.Printf("  [DB] Error reading GitLab issues: %v\n", err)
 		}
 		return nil, nil, err
 	}
 
 	if debugMode {
-		fmt.Printf("  [DB] Loaded %d issues from database\n", len(issues))
+		fmt.Printf("  [DB] Loaded %d GitLab issues from database\n", len(items))
 	}
 
-	return issues, labels, nil
+	return items, labels, nil
 }
 
-func (d *Database) GetAllComments() ([]string, error) {
-	var comments []string
-
+func (d *Database) HasGitLabData() (bool, error) {
+	hasData := false
 	err := d.db.View(func(tx *bolt.Tx) error {
-		b := tx.Bucket(commentsBucket)
-		return b.ForEach(func(k, v []byte) error {
-			comments = append(comments, string(v))
+		b := tx.Bucket(gitlabMergeRequestsBkt)
+		if b != nil && b.Stats().KeyN > 0 {
+			hasData = true
 			return nil
-		})
-	})
+		}
 
+		b = tx.Bucket(gitlabIssuesBkt)
+		if b != nil && b.Stats().KeyN > 0 {
+			hasData = true
+		}
+		return nil
+	})
 	if err != nil {
-		return nil, err
+		return false, err
 	}
-	return comments, nil
+	return hasData, nil
 }
 
-func (d *Database) GetPRComments(owner, repo string, prNumber int) ([]*github.PullRequestComment, error) {
-	var comments []*github.PullRequestComment
-	prefix := fmt.Sprintf("%s/%s#%d/pr_review_comment/", owner, repo, prNumber)
+func (d *Database) GetGitLabNotes(pathWithNamespace, itemType string, iid int) ([]GitLabNoteRecord, error) {
+	notes := make([]GitLabNoteRecord, 0)
+	prefix := fmt.Sprintf(
+		"%s|%s|%d|",
+		normalizeProjectPathWithNamespace(pathWithNamespace),
+		strings.ToLower(strings.TrimSpace(itemType)),
+		iid,
+	)
 
 	err := d.db.View(func(tx *bolt.Tx) error {
-		b := tx.Bucket(commentsBucket)
+		b := tx.Bucket(gitlabNotesBkt)
+		if b == nil {
+			return nil
+		}
+
 		c := b.Cursor()
-
 		for k, v := c.Seek([]byte(prefix)); k != nil && strings.HasPrefix(string(k), prefix); k, v = c.Next() {
-			var comment github.PullRequestComment
-			if err := json.Unmarshal(v, &comment); err != nil {
+			var record GitLabNoteRecord
+			if err := json.Unmarshal(v, &record); err != nil {
 				return err
 			}
-			comments = append(comments, &comment)
+			notes = append(notes, record)
 		}
 		return nil
 	})
-
 	if err != nil {
 		return nil, err
 	}
-	return comments, nil
+	return notes, nil
 }
