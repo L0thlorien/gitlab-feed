@@ -26,7 +26,7 @@ go build -o gitlab-feed .
 
 Download from GitHub Releases:
 
-- https://github.com/zveinn/github-feed/releases
+- https://github.com/L0thlorien/gitlab-feed/releases
 
 ## Configuration
 

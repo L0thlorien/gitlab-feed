@@ -1,4 +1,4 @@
-module github.com/sveinn/github-feed
+module github.com/L0thlorien/gitlab-feed
 
 go 1.25
 

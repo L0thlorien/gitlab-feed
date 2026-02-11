@@ -64,8 +64,8 @@ changelog:
 
 release:
   github:
-    owner: zveinn
-    name: github-feed
+    owner: L0thlorien
+    name: gitlab-feed
   draft: false
   prerelease: auto
   mode: replace

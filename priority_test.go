@@ -16,8 +16,8 @@ import (
 	"testing"
 	"time"
 
-	bolt "go.etcd.io/bbolt"
 	gitlab "gitlab.com/gitlab-org/api/client-go"
+	bolt "go.etcd.io/bbolt"
 )
 
 func TestPRLabelPriority(t *testing.T) {
@@ -1233,7 +1233,6 @@ func TestGitLabCLIWithMockServer_ShowsMergeRequestsAndIssues(t *testing.T) {
 	}
 
 	cmd := exec.CommandContext(ctx, "go", "run", ".", "--debug", "--time", "1d")
-	cmd.Dir = "/home/wintermute/repos/github-feed"
 	var stdoutBuf bytes.Buffer
 	var stderrBuf bytes.Buffer
 	cmd.Stdout = &stdoutBuf
