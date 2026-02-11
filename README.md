@@ -1,6 +1,6 @@
 # GitAI - GitLab Activity Monitor
 
-GitLab Feed is a Go CLI for monitoring GitLab merge requests and issues across a bounded set of projects.
+A fast, colorful CLI tool for monitoring GitLab pull requests and issues across repositories. Track your contributions, reviews, and assignments with real-time progress visualization.
 
 fork from [GitAI GitHub feed](https://github.com/zveinn/github-feed)
 
