@@ -1,5 +1,7 @@
 version: 2
 
+project_name: gitlab-feed
+
 before:
   hooks:
     # You may remove this if you don't use go modules.
