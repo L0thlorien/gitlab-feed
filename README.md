@@ -34,16 +34,15 @@ Select the platform via `--platform github|gitlab` (default: `github`).
 
 Online mode requirements depend on platform:
 
-- GitHub: `GITHUB_TOKEN`, `GITHUB_USERNAME` (and optionally `ALLOWED_REPOS`)
-- GitLab: `GITLAB_TOKEN` (or `GITLAB_ACTIVITY_TOKEN`) and `ALLOWED_REPOS`
+- GitHub: `GITHUB_TOKEN`, `GITHUB_USERNAME` (and optionally `GITHUB_ALLOWED_REPOS`)
+- GitLab: `GITLAB_TOKEN` (or `GITLAB_ACTIVITY_TOKEN`) and `GITLAB_ALLOWED_REPOS`
 
 The app loads configuration in this order:
 
 1. CLI flags
 2. Environment variables
-3. Platform `.env` file (auto-created on first run)
-   - GitHub: `~/.github-feed/.env`
-   - GitLab: `~/.gitlab-feed/.env`
+3. Shared `.env` file (auto-created on first run)
+   - `~/.git-feed/.env`
 4. Built-in defaults
 
 ### Environment variables
@@ -52,14 +51,15 @@ GitHub:
 
 - `GITHUB_TOKEN` (required online)
 - `GITHUB_USERNAME` (required online)
-- `ALLOWED_REPOS` (optional; comma-separated `owner/repo`)
+- `GITHUB_ALLOWED_REPOS` (optional; comma-separated `owner/repo`)
 
 GitLab:
 
 - `GITLAB_TOKEN` or `GITLAB_ACTIVITY_TOKEN` (required online)
 - `GITLAB_HOST` (optional host override; takes precedence over `GITLAB_BASE_URL`)
 - `GITLAB_BASE_URL` (optional base URL, default: `https://gitlab.com`)
-- `ALLOWED_REPOS` (required online; comma-separated `group[/subgroup]/repo`)
+- `GITLAB_ALLOWED_REPOS` (required online; comma-separated `group[/subgroup]/repo`)
+- `ALLOWED_REPOS` (legacy fallback for either platform when platform-specific vars are unset)
 
 ### Example `.env`
 
@@ -68,8 +68,8 @@ GitLab:
 GITHUB_TOKEN=your_token_here
 GITHUB_USERNAME=your_username
 
-# Optional in online mode; if omitted, the tool relies on platform defaults/behavior.
-ALLOWED_REPOS=owner/repo1,owner/repo2
+# Optional in GitHub online mode
+GITHUB_ALLOWED_REPOS=owner/repo1,owner/repo2
 
 # GitLab (`--platform gitlab`)
 GITLAB_TOKEN=your_token_here
@@ -81,8 +81,11 @@ GITLAB_HOST=http://1.1.1.1
 # Optional explicit base URL (defaults to https://gitlab.com)
 GITLAB_BASE_URL=https://gitlab.com
 
-# Required in online mode
-ALLOWED_REPOS=team/repo1,platform/backend/repo2
+# Required in GitLab online mode
+GITLAB_ALLOWED_REPOS=team/repo1,platform/backend/repo2
+
+# Legacy fallback used only when platform-specific vars are unset
+ALLOWED_REPOS=
 ```
 
 ### Token scopes
@@ -148,14 +151,13 @@ Reference:
 
 ## Data and cache
 
-On first run, the tool creates a platform-specific config dir and cache DB:
+On first run, the tool creates a shared config dir with one env file and platform-specific cache DBs:
 
-- GitHub:
-  - `~/.github-feed/.env`
-  - `~/.github-feed/github.db`
-- GitLab:
-  - `~/.gitlab-feed/.env`
-  - `~/.gitlab-feed/gitlab.db`
+- Shared env:
+  - `~/.git-feed/.env`
+- Platform DBs:
+  - `~/.git-feed/github.db`
+  - `~/.git-feed/gitlab.db`
 
 Online mode fetches platform activity and updates cache.
 Offline mode (`--local`) reads from cache only.
@@ -164,15 +166,15 @@ Offline mode (`--local`) reads from cache only.
 
 ### GitHub online mode missing token/user
 
-Set `GITHUB_TOKEN` and `GITHUB_USERNAME` in env or `~/.github-feed/.env`.
+Set `GITHUB_TOKEN` and `GITHUB_USERNAME` in env or `~/.git-feed/.env`.
 
 ### GitLab online mode missing token
 
-Set `GITLAB_TOKEN` (or `GITLAB_ACTIVITY_TOKEN`) in env or `~/.gitlab-feed/.env`.
+Set `GITLAB_TOKEN` (or `GITLAB_ACTIVITY_TOKEN`) in env or `~/.git-feed/.env`.
 
-### GitLab online mode missing `ALLOWED_REPOS`
+### GitLab online mode missing `GITLAB_ALLOWED_REPOS`
 
-Set `ALLOWED_REPOS` with valid project paths (`group[/subgroup]/repo`).
+Set `GITLAB_ALLOWED_REPOS` with valid project paths (`group[/subgroup]/repo`).
 
 ### No open activity found
 
@@ -180,7 +182,7 @@ Try:
 
 - `--debug` to inspect resolved repos and API base URL
 - a wider window (for example `--time 24h`)
-- verifying `ALLOWED_REPOS` matches exact project paths
+- verifying `GITHUB_ALLOWED_REPOS` / `GITLAB_ALLOWED_REPOS` matches exact project paths
 
 ## Development
 

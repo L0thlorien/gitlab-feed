@@ -26,32 +26,32 @@ Select the platform via `--platform github|gitlab` (default: `github`).
 
 Online mode requirements depend on platform:
 
-- GitHub: `GITHUB_TOKEN`, `GITHUB_USERNAME` (and optionally `ALLOWED_REPOS`)
-- GitLab: `GITLAB_TOKEN` (or `GITLAB_ACTIVITY_TOKEN`) and `ALLOWED_REPOS`
+- GitHub: `GITHUB_TOKEN`, `GITHUB_USERNAME` (and optionally `GITHUB_ALLOWED_REPOS`)
+- GitLab: `GITLAB_TOKEN` (or `GITLAB_ACTIVITY_TOKEN`) and `GITLAB_ALLOWED_REPOS`
 
 The app loads configuration from:
 1) Environment variables
-2) Platform `.env` file (auto-created on first run)
-   - GitHub: `~/.github-feed/.env`
-   - GitLab: `~/.gitlab-feed/.env`
+2) Shared `.env` file (auto-created on first run)
+   - `~/.git-feed/.env`
 
 Precedence order:
 1) CLI flags
 2) Environment variables
-3) Platform `.env` file
+3) Shared `.env` file
 4) Built-in defaults
 
 Environment variables:
 - GitHub
   - `GITHUB_TOKEN` (required online)
   - `GITHUB_USERNAME` (required online)
-  - `ALLOWED_REPOS` (optional; comma-separated `owner/repo`)
+  - `GITHUB_ALLOWED_REPOS` (optional; comma-separated `owner/repo`)
 
 - GitLab
   - `GITLAB_TOKEN` or `GITLAB_ACTIVITY_TOKEN` (required online)
   - `GITLAB_HOST` (optional host override; takes precedence over `GITLAB_BASE_URL`)
   - `GITLAB_BASE_URL` (optional; default: `https://gitlab.com`)
-  - `ALLOWED_REPOS` (required online; comma-separated `group[/subgroup]/repo`)
+  - `GITLAB_ALLOWED_REPOS` (required online; comma-separated `group[/subgroup]/repo`)
+  - `ALLOWED_REPOS` (legacy fallback for either platform when platform-specific vars are unset)
   - `GITLAB_USERNAME` or `GITLAB_USER` (optional legacy override; user is normally auto-resolved via API)
 
 Token scopes:
@@ -61,8 +61,8 @@ Token scopes:
 Reference: https://docs.gitlab.com/user/profile/personal_access_tokens/
 
 Database cache:
-- GitHub: `~/.github-feed/github.db` (BBolt)
-- GitLab: `~/.gitlab-feed/gitlab.db` (BBolt)
+- GitHub: `~/.git-feed/github.db` (BBolt)
+- GitLab: `~/.git-feed/gitlab.db` (BBolt)
 
 ## Testing
 

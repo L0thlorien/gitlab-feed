@@ -1023,6 +1023,66 @@ func TestLoadEnvFile_DoesNotOverrideExistingEnv(t *testing.T) {
 	}
 }
 
+func TestResolveAllowedRepos_PerPlatformAndFallback(t *testing.T) {
+	tests := []struct {
+		name          string
+		platform      string
+		flagValue     string
+		githubAllowed string
+		gitlabAllowed string
+		legacyAllowed string
+		want          string
+	}{
+		{
+			name:          "flag overrides all env vars",
+			platform:      "gitlab",
+			flagValue:     "flag/repo",
+			githubAllowed: "gh/repo",
+			gitlabAllowed: "gl/repo",
+			legacyAllowed: "legacy/repo",
+			want:          "flag/repo",
+		},
+		{
+			name:          "github uses platform-specific var",
+			platform:      "github",
+			githubAllowed: "owner/repo1,owner/repo2",
+			legacyAllowed: "legacy/repo",
+			want:          "owner/repo1,owner/repo2",
+		},
+		{
+			name:          "gitlab uses platform-specific var",
+			platform:      "gitlab",
+			gitlabAllowed: "group/repo,group/subgroup/repo",
+			legacyAllowed: "legacy/repo",
+			want:          "group/repo,group/subgroup/repo",
+		},
+		{
+			name:          "fallback to legacy var when platform var missing",
+			platform:      "gitlab",
+			legacyAllowed: "legacy/team/repo",
+			want:          "legacy/team/repo",
+		},
+		{
+			name:     "empty when nothing provided",
+			platform: "github",
+			want:     "",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Setenv("GITHUB_ALLOWED_REPOS", tt.githubAllowed)
+			t.Setenv("GITLAB_ALLOWED_REPOS", tt.gitlabAllowed)
+			t.Setenv("ALLOWED_REPOS", tt.legacyAllowed)
+
+			got := resolveAllowedRepos(tt.platform, tt.flagValue)
+			if got != tt.want {
+				t.Fatalf("resolveAllowedRepos(%q, %q) = %q, want %q", tt.platform, tt.flagValue, got, tt.want)
+			}
+		})
+	}
+}
+
 func TestValidateConfig_PlatformBranching(t *testing.T) {
 	if err := validateConfig("gitlab", "", "", false, "/tmp/.env", nil); err == nil {
 		t.Fatalf("validateConfig(gitlab, empty token) error = nil, want non-nil")
@@ -1254,7 +1314,7 @@ func TestGitLabCLIWithMockServer_ShowsMergeRequestsAndIssues(t *testing.T) {
 	defer cancel()
 
 	homeDir := t.TempDir()
-	configDir := filepath.Join(homeDir, ".gitlab-feed")
+	configDir := filepath.Join(homeDir, ".git-feed")
 	if err := os.MkdirAll(configDir, 0o755); err != nil {
 		t.Fatalf("failed to create config directory: %v", err)
 	}

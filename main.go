@@ -253,6 +253,23 @@ func parseTimeRange(timeStr string) (time.Duration, error) {
 	return duration, nil
 }
 
+func resolveAllowedRepos(platform, allowedReposFlag string) string {
+	if value := strings.TrimSpace(allowedReposFlag); value != "" {
+		return value
+	}
+
+	platformVar := "GITHUB_ALLOWED_REPOS"
+	if platform == "gitlab" {
+		platformVar = "GITLAB_ALLOWED_REPOS"
+	}
+
+	if value := strings.TrimSpace(os.Getenv(platformVar)); value != "" {
+		return value
+	}
+
+	return strings.TrimSpace(os.Getenv("ALLOWED_REPOS"))
+}
+
 func main() {
 	// Define flags
 	var timeRangeStr string
@@ -271,7 +288,7 @@ func main() {
 	flag.BoolVar(&showLinks, "links", false, "Show hyperlinks underneath each PR/issue")
 	flag.BoolVar(&llMode, "ll", false, "Shortcut for --local --links (offline mode with links)")
 	flag.BoolVar(&cleanCache, "clean", false, "Delete and recreate the database cache")
-	flag.StringVar(&allowedReposFlag, "allowed-repos", "", "Comma-separated list of allowed repos (e.g., group/repo,group/subgroup/repo)")
+	flag.StringVar(&allowedReposFlag, "allowed-repos", "", "Comma-separated list of allowed repos (GitHub: owner/repo; GitLab: group[/subgroup]/repo)")
 
 	// Custom usage message
 	flag.Usage = func() {
@@ -286,10 +303,12 @@ func main() {
 		fmt.Fprintln(os.Stderr, "  GITLAB_BASE_URL                        - Optional GitLab base URL (default: https://gitlab.com)")
 		fmt.Fprintln(os.Stderr, "  GITHUB_TOKEN                           - GitHub Personal Access Token")
 		fmt.Fprintln(os.Stderr, "  GITHUB_USERNAME                        - Required in GitHub online mode")
-		fmt.Fprintln(os.Stderr, "  ALLOWED_REPOS                          - Required in online mode (group[/subgroup]/repo)")
+		fmt.Fprintln(os.Stderr, "  GITHUB_ALLOWED_REPOS                   - Optional in GitHub online mode (owner/repo)")
+		fmt.Fprintln(os.Stderr, "  GITLAB_ALLOWED_REPOS                   - Required in GitLab online mode (group[/subgroup]/repo)")
+		fmt.Fprintln(os.Stderr, "  ALLOWED_REPOS                          - Legacy fallback when platform-specific vars are unset")
 		fmt.Fprintln(os.Stderr, "\nConfiguration File:")
-		fmt.Fprintln(os.Stderr, "  ~/.gitlab-feed/.env                    - GitLab configuration file (auto-created)")
-		fmt.Fprintln(os.Stderr, "  ~/.github-feed/.env                    - GitHub configuration file (auto-created)")
+		fmt.Fprintln(os.Stderr, "  ~/.git-feed/.env                       - Shared configuration file (auto-created)")
+		fmt.Fprintln(os.Stderr, "  ~/.git-feed/github.db|gitlab.db        - Platform-specific cache databases")
 	}
 
 	flag.Parse()
@@ -320,50 +339,57 @@ func main() {
 		os.Exit(1)
 	}
 
-	configDir := filepath.Join(homeDir, ".github-feed")
+	configDir := filepath.Join(homeDir, ".git-feed")
 	dbFileName := "github.db"
+	if platform == "gitlab" {
+		dbFileName = "gitlab.db"
+	}
+
 	envTemplate := `# Activity Feed Configuration
-# Add your API credentials here
+# Shared environment file for both platforms
 
-# Your GitHub Personal Access Token (required for online mode)
+# =========================
+# GitHub (--platform github)
+# =========================
+
+# Required in GitHub online mode
 GITHUB_TOKEN=
-
-# Required in online mode
 GITHUB_USERNAME=
 
-# Optional: comma-separated allowed repos
-# Example: owner/repo,owner/another-repo
-ALLOWED_REPOS=
-`
+	# Optional in GitHub online mode
+	# Comma-separated owner/repo values
+	# Example: owner/repo,owner/another-repo
+	GITHUB_ALLOWED_REPOS=
 
-	if platform == "gitlab" {
-		configDir = filepath.Join(homeDir, ".gitlab-feed")
-		dbFileName = "gitlab.db"
-		envTemplate = `# Activity Feed Configuration
-# Add your API credentials here
+# =========================
+# GitLab (--platform gitlab)
+# =========================
 
-# Your GitLab Personal Access Token (required for online mode)
+# Required in GitLab online mode
 # Recommended scope: read_api (or api on some self-managed instances)
 GITLAB_TOKEN=
+# Optional alternative token variable supported by the app
+GITLAB_ACTIVITY_TOKEN=
 
-# Optional username (the app also resolves the current user via API)
+# Optional username (the app can also resolve current user via API)
 GITLAB_USERNAME=
 
-		# Optional: GitLab host for self-managed/cloud instances
-		# Example: http://10.10.1.207/
-		# If set, this overrides GITLAB_BASE_URL.
-		GITLAB_HOST=
+# Optional: GitLab host for self-managed/cloud instances
+# If set, this overrides GITLAB_BASE_URL.
+GITLAB_HOST=
 
-		# Optional: full GitLab base URL (supports path prefixes)
-		# Default: https://gitlab.com
-		GITLAB_BASE_URL=https://gitlab.com
+# Optional: full GitLab base URL (supports path prefixes)
+# Default: https://gitlab.com
+GITLAB_BASE_URL=https://gitlab.com
 
-# Required in online mode: comma-separated allowed repos
-# Format: group/repo or group/subgroup/repo
-# Example self-managed repo path: platform/backend/gitlab-feed
-ALLOWED_REPOS=
-`
-	}
+	# Required in GitLab online mode
+	# Comma-separated group[/subgroup]/repo values
+	# Example: team/repo,platform/backend/git-feed
+	GITLAB_ALLOWED_REPOS=
+
+	# Legacy fallback when platform-specific vars are unset
+	ALLOWED_REPOS=
+	`
 
 	if err := os.MkdirAll(configDir, 0o755); err != nil {
 		fmt.Printf("Error: Could not create config directory %s: %v\n", configDir, err)
@@ -379,10 +405,7 @@ ALLOWED_REPOS=
 
 	_ = loadEnvFile(envPath)
 
-	allowedReposStr := allowedReposFlag
-	if allowedReposStr == "" {
-		allowedReposStr = os.Getenv("ALLOWED_REPOS")
-	}
+	allowedReposStr := resolveAllowedRepos(platform, allowedReposFlag)
 
 	var allowedRepos map[string]bool
 	if allowedReposStr != "" {
@@ -532,7 +555,7 @@ func validateConfig(platform, token, githubUsername string, localMode bool, envP
 			return fmt.Errorf("token is required for GitLab API mode.\n\nTo fix this:\n  - Set GITLAB_TOKEN or GITLAB_ACTIVITY_TOKEN\n  - Or add it to %s", envPath)
 		}
 		if len(allowedRepos) == 0 {
-			return fmt.Errorf("ALLOWED_REPOS is required for GitLab API mode to keep API usage bounded.\n\nTo fix this:\n  - Set ALLOWED_REPOS with group[/subgroup]/repo paths\n  - Example: ALLOWED_REPOS=team/service,platform/backend/gitlab-feed\n  - Or add it to %s", envPath)
+			return fmt.Errorf("GITLAB_ALLOWED_REPOS is required for GitLab API mode to keep API usage bounded.\n\nTo fix this:\n  - Set GITLAB_ALLOWED_REPOS with group[/subgroup]/repo paths\n  - Example: GITLAB_ALLOWED_REPOS=team/service,platform/backend/git-feed\n  - Or use legacy fallback ALLOWED_REPOS\n  - Or add it to %s", envPath)
 		}
 	case "github":
 		if token == "" {
