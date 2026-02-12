@@ -1,32 +1,29 @@
-# GitAI - Activity Monitor
+# GitAI - Git Feed Activity Monitor
 
 A fast, colorful CLI tool for monitoring GitHub pull requests and GitLab merge requests and issues across repositories. Track your contributions, reviews, and assignments with real-time progress visualization.
 
-fork from [GitAI GitHub feed](https://github.com/zveinn/github-feed)
-
 ## Features
 
-- Parallel API fetching for faster scans
-- Colorized, grouped output (open/closed/merged)
-- Smart MR/issue cross-reference nesting
-- Online mode with local BBolt cache
-- Offline mode from cache (`--local`)
-- Time-window filtering (`--time 1h|2d|3w|4m|1y`)
-- Retry/backoff for API rate-limit and transient API errors
+- 🚀 **Parallel API fetching** - Faster scans across repositories
+- 🎨 **Colorized grouped output** - Easy-to-read open/closed/merged sections
+- 🔗 **Smart cross-reference nesting** - Links related MRs and issues
+- 💾 **Online + local BBolt cache** - Fetch online or use `--local` offline mode
+- ⏱ **Time-window filtering** - Configure with `--time 1h|2d|3w|4m|1y`
+- ♻️ **Retry/backoff handling** - Better resilience to API rate limits and transient failures
 
 ## Installation
 
 ### Build from source
 
 ```bash
-go build -o gitlab-feed .
+go build -o git-feed .
 ```
 
 ### Pre-built binaries
 
 Download from GitHub Releases:
 
-- https://github.com/L0thlorien/gitlab-feed/releases
+- https://github.com/zveinn/git-feed/releases
 
 ## Configuration
 
@@ -103,37 +100,37 @@ Reference:
 
 ```bash
 # Default: last month (1m), online mode, platform=github
-./gitlab-feed
+./git-feed
 
 # Explicit platform
-./gitlab-feed --platform github
-./gitlab-feed --platform gitlab
+./git-feed --platform github
+./git-feed --platform gitlab
 
 # Time window examples
-./gitlab-feed --time 3h
-./gitlab-feed --time 2d
-./gitlab-feed --time 3w
-./gitlab-feed --time 6m
-./gitlab-feed --time 1y
+./git-feed --time 3h
+./git-feed --time 2d
+./git-feed --time 3w
+./git-feed --time 6m
+./git-feed --time 1y
 
 # Debug output
-./gitlab-feed --debug
+./git-feed --debug
 
 # Offline from cache
-./gitlab-feed --local
+./git-feed --local
 
 # Show links
-./gitlab-feed --links
+./git-feed --links
 
 # Shortcut: --local --links
-./gitlab-feed --ll
+./git-feed --ll
 
 # Recreate cache DB
-./gitlab-feed --clean
+./git-feed --clean
 
 # Override allowed repos from CLI
-./gitlab-feed --allowed-repos "owner/repo,owner/other"
-./gitlab-feed --platform gitlab --allowed-repos "group/repo,group/subgroup/repo"
+./git-feed --allowed-repos "owner/repo,owner/other"
+./git-feed --platform gitlab --allowed-repos "group/repo,group/subgroup/repo"
 ```
 
 ### Flags
@@ -188,7 +185,7 @@ Try:
 
 ```bash
 go test ./... -count=1
-go build -o gitlab-feed .
+go build -o git-feed .
 ```
 
 Current core files:

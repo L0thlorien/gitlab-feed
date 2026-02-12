@@ -284,7 +284,7 @@ func main() {
 	flag.StringVar(&timeRangeStr, "time", "1m", "Show items from last time range (1h, 2d, 3w, 4m, 1y)")
 	flag.StringVar(&platform, "platform", "github", "Platform to use (gitlab|github)")
 	flag.BoolVar(&debugMode, "debug", false, "Show detailed API logging")
-	flag.BoolVar(&localMode, "local", false, "Use local database instead of GitLab API")
+	flag.BoolVar(&localMode, "local", false, "Use local database instead of platform API")
 	flag.BoolVar(&showLinks, "links", false, "Show hyperlinks underneath each PR/issue")
 	flag.BoolVar(&llMode, "ll", false, "Shortcut for --local --links (offline mode with links)")
 	flag.BoolVar(&cleanCache, "clean", false, "Delete and recreate the database cache")
@@ -293,7 +293,7 @@ func main() {
 	// Custom usage message
 	flag.Usage = func() {
 		fmt.Fprintf(os.Stderr, "Usage: %s [options]\n\n", os.Args[0])
-		fmt.Fprintln(os.Stderr, "GitLab Feed - Monitor pull requests and issues across repositories")
+		fmt.Fprintln(os.Stderr, "Git Feed - Monitor pull requests and issues across repositories")
 		fmt.Fprintln(os.Stderr, "\nOptions:")
 		flag.PrintDefaults()
 		fmt.Fprintln(os.Stderr, "\nEnvironment Variables:")
