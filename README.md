@@ -1,6 +1,6 @@
-# GitAI - GitLab Activity Monitor
+# GitAI - Activity Monitor
 
-A fast, colorful CLI tool for monitoring GitLab pull requests and issues across repositories. Track your contributions, reviews, and assignments with real-time progress visualization.
+A fast, colorful CLI tool for monitoring GitHub pull requests and GitLab merge requests and issues across repositories. Track your contributions, reviews, and assignments with real-time progress visualization.
 
 fork from [GitAI GitHub feed](https://github.com/zveinn/github-feed)
 
@@ -12,7 +12,7 @@ fork from [GitAI GitHub feed](https://github.com/zveinn/github-feed)
 - Online mode with local BBolt cache
 - Offline mode from cache (`--local`)
 - Time-window filtering (`--time 1h|2d|3w|4m|1y`)
-- Retry/backoff for GitLab rate-limit and transient API errors
+- Retry/backoff for API rate-limit and transient API errors
 
 ## Installation
 
@@ -30,19 +30,31 @@ Download from GitHub Releases:
 
 ## Configuration
 
-Online mode requires:
+Select the platform via `--platform github|gitlab` (default: `github`).
 
-- `GITLAB_TOKEN` (or `GITLAB_ACTIVITY_TOKEN`)
-- `ALLOWED_REPOS`
+Online mode requirements depend on platform:
+
+- GitHub: `GITHUB_TOKEN`, `GITHUB_USERNAME` (and optionally `ALLOWED_REPOS`)
+- GitLab: `GITLAB_TOKEN` (or `GITLAB_ACTIVITY_TOKEN`) and `ALLOWED_REPOS`
 
 The app loads configuration in this order:
 
-1. Environment variables
-2. `~/.gitlab-feed/.env` (auto-created on first run)
-
-Environment variables take precedence over `.env` values.
+1. CLI flags
+2. Environment variables
+3. Platform `.env` file (auto-created on first run)
+   - GitHub: `~/.github-feed/.env`
+   - GitLab: `~/.gitlab-feed/.env`
+4. Built-in defaults
 
 ### Environment variables
+
+GitHub:
+
+- `GITHUB_TOKEN` (required online)
+- `GITHUB_USERNAME` (required online)
+- `ALLOWED_REPOS` (optional; comma-separated `owner/repo`)
+
+GitLab:
 
 - `GITLAB_TOKEN` or `GITLAB_ACTIVITY_TOKEN` (required online)
 - `GITLAB_HOST` (optional host override; takes precedence over `GITLAB_BASE_URL`)
@@ -52,6 +64,14 @@ Environment variables take precedence over `.env` values.
 ### Example `.env`
 
 ```bash
+# GitHub (`--platform github`)
+GITHUB_TOKEN=your_token_here
+GITHUB_USERNAME=your_username
+
+# Optional in online mode; if omitted, the tool relies on platform defaults/behavior.
+ALLOWED_REPOS=owner/repo1,owner/repo2
+
+# GitLab (`--platform gitlab`)
 GITLAB_TOKEN=your_token_here
 
 # Optional host override, e.g. self-managed GitLab
@@ -79,8 +99,12 @@ Reference:
 ## Usage
 
 ```bash
-# Default: last month (1m), online mode
+# Default: last month (1m), online mode, platform=github
 ./gitlab-feed
+
+# Explicit platform
+./gitlab-feed --platform github
+./gitlab-feed --platform gitlab
 
 # Time window examples
 ./gitlab-feed --time 3h
@@ -105,7 +129,8 @@ Reference:
 ./gitlab-feed --clean
 
 # Override allowed repos from CLI
-./gitlab-feed --allowed-repos "group/repo,group/subgroup/repo"
+./gitlab-feed --allowed-repos "owner/repo,owner/other"
+./gitlab-feed --platform gitlab --allowed-repos "group/repo,group/subgroup/repo"
 ```
 
 ### Flags
@@ -113,30 +138,39 @@ Reference:
 | Flag | Description |
 |------|-------------|
 | `--time RANGE` | Show items from last time range (default: `1m`). Examples: `1h`, `2d`, `3w`, `4m`, `1y` |
+| `--platform PLATFORM` | Activity source platform: `github` or `gitlab` (default: `github`) |
 | `--debug` | Show detailed API logging |
-| `--local` | Use local database instead of GitLab API |
+| `--local` | Use local database instead of API |
 | `--links` | Show hyperlinks under each MR/issue |
 | `--ll` | Shortcut for `--local --links` |
 | `--clean` | Delete and recreate the database cache |
-| `--allowed-repos REPOS` | Comma-separated project paths (`group/repo,group/subgroup/repo`) |
+| `--allowed-repos REPOS` | Comma-separated repo paths (GitHub: `owner/repo`; GitLab: `group[/subgroup]/repo`) |
 
 ## Data and cache
 
-On first run, the tool creates:
+On first run, the tool creates a platform-specific config dir and cache DB:
 
-- `~/.gitlab-feed/.env`
-- `~/.gitlab-feed/gitlab.db`
+- GitHub:
+  - `~/.github-feed/.env`
+  - `~/.github-feed/github.db`
+- GitLab:
+  - `~/.gitlab-feed/.env`
+  - `~/.gitlab-feed/gitlab.db`
 
-Online mode fetches GitLab activity and updates cache.
+Online mode fetches platform activity and updates cache.
 Offline mode (`--local`) reads from cache only.
 
 ## Troubleshooting
 
-### `token is required for GitLab API mode`
+### GitHub online mode missing token/user
+
+Set `GITHUB_TOKEN` and `GITHUB_USERNAME` in env or `~/.github-feed/.env`.
+
+### GitLab online mode missing token
 
 Set `GITLAB_TOKEN` (or `GITLAB_ACTIVITY_TOKEN`) in env or `~/.gitlab-feed/.env`.
 
-### `ALLOWED_REPOS is required for GitLab API mode`
+### GitLab online mode missing `ALLOWED_REPOS`
 
 Set `ALLOWED_REPOS` with valid project paths (`group[/subgroup]/repo`).
 
