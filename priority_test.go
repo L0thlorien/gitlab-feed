@@ -636,14 +636,14 @@ func TestLoadGitLabCachedActivities_OfflineParityFiltersAndOrder(t *testing.T) {
 	if len(activities) != 1 {
 		t.Fatalf("MR activities count = %d, want 1", len(activities))
 	}
-	if activities[0].MR.Title != "new mr" || activities[0].Label != "Authored" || activities[0].Owner != "group/repo" {
+	if activities[0].MR.Title != "new mr" || activities[0].Label != "Authored" || activities[0].Owner != "group" || activities[0].Repo != "repo" {
 		t.Fatalf("unexpected MR activity %+v", activities[0])
 	}
 
 	if len(issueActivities) != 1 {
 		t.Fatalf("Issue activities count = %d, want 1", len(issueActivities))
 	}
-	if issueActivities[0].Issue.Title != "new issue" || issueActivities[0].Label != "Commented" || issueActivities[0].Owner != "group/repo" {
+	if issueActivities[0].Issue.Title != "new issue" || issueActivities[0].Label != "Commented" || issueActivities[0].Owner != "group" || issueActivities[0].Repo != "repo" {
 		t.Fatalf("unexpected issue activity %+v", issueActivities[0])
 	}
 
@@ -820,7 +820,7 @@ func TestFetchGitLabProjectActivities_PaginatesAndFiltersByCutoff(t *testing.T) 
 	if len(activities) != 2 {
 		t.Fatalf("got %d merge request activities, want 2", len(activities))
 	}
-	if activities[0].Owner != "group/subgroup/repo" || activities[0].Repo != "" {
+	if activities[0].Owner != "group/subgroup" || activities[0].Repo != "repo" {
 		t.Fatalf("unexpected project mapping for merge request activity: owner=%q repo=%q", activities[0].Owner, activities[0].Repo)
 	}
 
@@ -1003,6 +1003,52 @@ func TestFetchGitLabProjectActivities_DerivesLabelsFromSources(t *testing.T) {
 	}
 	if issueNoteCalls[21] != 1 || issueNoteCalls[22] != 1 {
 		t.Fatalf("issue note calls = %+v, want issue 21 and 22 exactly once", issueNoteCalls)
+	}
+}
+
+func TestLoadEnvFile_DoesNotOverrideExistingEnv(t *testing.T) {
+	envPath := filepath.Join(t.TempDir(), ".env")
+	if err := os.WriteFile(envPath, []byte("FOO=fromfile\n"), 0o644); err != nil {
+		t.Fatalf("WriteFile failed: %v", err)
+	}
+
+	t.Setenv("FOO", "fromenv")
+
+	if err := loadEnvFile(envPath); err != nil {
+		t.Fatalf("loadEnvFile failed: %v", err)
+	}
+
+	if got := os.Getenv("FOO"); got != "fromenv" {
+		t.Fatalf("FOO = %q, want fromenv", got)
+	}
+}
+
+func TestValidateConfig_PlatformBranching(t *testing.T) {
+	if err := validateConfig("gitlab", "", "", false, "/tmp/.env", nil); err == nil {
+		t.Fatalf("validateConfig(gitlab, empty token) error = nil, want non-nil")
+	}
+	if err := validateConfig("gitlab", "token", "", false, "/tmp/.env", map[string]bool{}); err == nil {
+		t.Fatalf("validateConfig(gitlab, empty allowed repos) error = nil, want non-nil")
+	}
+	if err := validateConfig("gitlab", "token", "", false, "/tmp/.env", map[string]bool{"group/subgroup/repo": true}); err != nil {
+		t.Fatalf("validateConfig(gitlab, valid inputs) error = %v, want nil", err)
+	}
+
+	if err := validateConfig("github", "", "user", false, "/tmp/.env", nil); err == nil {
+		t.Fatalf("validateConfig(github, empty token) error = nil, want non-nil")
+	}
+	if err := validateConfig("github", "token", "", false, "/tmp/.env", nil); err == nil {
+		t.Fatalf("validateConfig(github, empty username) error = nil, want non-nil")
+	}
+	if err := validateConfig("github", "token", "user", false, "/tmp/.env", nil); err != nil {
+		t.Fatalf("validateConfig(github, valid inputs) error = %v, want nil", err)
+	}
+
+	if err := validateConfig("gitlab", "", "", true, "/tmp/.env", nil); err != nil {
+		t.Fatalf("validateConfig(gitlab, local mode) error = %v, want nil", err)
+	}
+	if err := validateConfig("github", "", "", true, "/tmp/.env", nil); err != nil {
+		t.Fatalf("validateConfig(github, local mode) error = %v, want nil", err)
 	}
 }
 
@@ -1232,7 +1278,7 @@ func TestGitLabCLIWithMockServer_ShowsMergeRequestsAndIssues(t *testing.T) {
 		t.Fatalf("failed to create GOCACHE: %v", err)
 	}
 
-	cmd := exec.CommandContext(ctx, "go", "run", ".", "--debug", "--time", "1d")
+	cmd := exec.CommandContext(ctx, "go", "run", ".", "--platform", "gitlab", "--debug", "--time", "1d")
 	var stdoutBuf bytes.Buffer
 	var stderrBuf bytes.Buffer
 	cmd.Stdout = &stdoutBuf
