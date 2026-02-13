@@ -1,201 +1,322 @@
-# GitAI - Git Feed Activity Monitor
+# GitAI - GitHub Activity Monitor
 
-A fast, colorful CLI tool for monitoring GitHub pull requests and GitLab merge requests and issues across repositories. Track your contributions, reviews, and assignments with real-time progress visualization.
+A fast, colorful CLI tool for monitoring GitHub pull requests/issues and GitLab merge requests/issues across repositories. Track your contributions, reviews, and assignments with real-time progress visualization.
 
 ## Features
 
-- 🚀 **Parallel API fetching** - Faster scans across repositories
-- 🎨 **Colorized grouped output** - Easy-to-read open/closed/merged sections
-- 🔗 **Smart cross-reference nesting** - Links related MRs and issues
-- 💾 **Online + local BBolt cache** - Fetch online or use `--local` offline mode
-- ⏱ **Time-window filtering** - Configure with `--time 1h|2d|3w|4m|1y`
-- ♻️ **Retry/backoff handling** - Better resilience to API rate limits and transient failures
+- 🚀 **Parallel API Calls** - Fetches data concurrently for maximum speed
+- 🎨 **Colorized Output** - Easy-to-read color-coded labels, states, and progress
+- 📊 **Smart Cross-Referencing** - Automatically links related PRs and issues
+- ⚡ **Real-Time Progress Bar** - Visual feedback with color-coded completion status
+- 🔍 **Comprehensive Search** - Tracks authored, mentioned, assigned, commented, and reviewed items
+- 📅 **Time Filtering** - View items from the last month by default (configurable with `--time`)
+- 🎯 **Organized Display** - Separates open, merged, and closed items into clear sections
 
 ## Installation
 
-### Build from source
+### Pre-built Binaries (Recommended)
+
+Download the latest release for your platform from the [releases page](https://github.com/zveinn/git-feed/releases):
+
+**macOS**
+```bash
+# Intel Mac
+curl -L https://github.com/zveinn/git-feed/releases/latest/download/git-feed_<VERSION>_Darwin_x86_64.tar.gz | tar xz
+chmod +x git-feed
+sudo mv git-feed /usr/local/bin/
+
+# Apple Silicon Mac
+curl -L https://github.com/zveinn/git-feed/releases/latest/download/git-feed_<VERSION>_Darwin_arm64.tar.gz | tar xz
+chmod +x git-feed
+sudo mv git-feed /usr/local/bin/
+```
+
+**Linux**
+```bash
+# x86_64
+curl -L https://github.com/zveinn/git-feed/releases/latest/download/git-feed_<VERSION>_Linux_x86_64.tar.gz | tar xz
+chmod +x git-feed
+sudo mv git-feed /usr/local/bin/
+
+# ARM64
+curl -L https://github.com/zveinn/git-feed/releases/latest/download/git-feed_<VERSION>_Linux_arm64.tar.gz | tar xz
+chmod +x git-feed
+sudo mv git-feed /usr/local/bin/
+```
+
+**Windows**
+
+Download the appropriate `.zip` file from the releases page, extract it, and add `git-feed.exe` to your PATH.
+
+### Build from Source
 
 ```bash
 go build -o git-feed .
 ```
 
-### Pre-built binaries
+### Release Management
 
-Download from GitHub Releases:
+Releases are automatically built and published via GitHub Actions using GoReleaser:
 
-- https://github.com/zveinn/git-feed/releases
+```bash
+# Create a new release
+git tag -a v1.0.0 -m "Release v1.0.0"
+git push origin v1.0.0
+```
+
+This will automatically:
+- Build binaries for Linux (amd64, arm64), macOS (Intel, Apple Silicon), and Windows (amd64)
+- Generate checksums for all releases
+- Create a GitHub release with installation instructions
+- Publish all artifacts to the releases page
 
 ## Configuration
 
-Select the platform via `--platform github|gitlab` (default: `github`).
+### First Run Setup
 
-Online mode requirements depend on platform:
+On first run, GitAI automatically creates a configuration directory at `~/.git-feed/` with:
+- `.env` - Shared configuration file for GitHub and GitLab
+- `github.db` - Local database for caching GitHub data
+- `gitlab.db` - Local database for caching GitLab data
 
-- GitHub: `GITHUB_TOKEN`, `GITHUB_USERNAME` (and optionally `GITHUB_ALLOWED_REPOS`)
-- GitLab: `GITLAB_TOKEN` (or `GITLAB_ACTIVITY_TOKEN`) and `GITLAB_ALLOWED_REPOS`
+### GitHub Token Setup
 
-The app loads configuration in this order:
+Create a GitHub Personal Access Token with the following scopes:
+- `repo` - Access to repositories
+- `read:org` - Read organization data
 
-1. CLI flags
-2. Environment variables
-3. Shared `.env` file (auto-created on first run)
-   - `~/.git-feed/.env`
-4. Built-in defaults
+**Generate token:** https://github.com/settings/tokens
 
-### Environment variables
+### Environment Setup
 
-GitHub:
+You can provide credentials via a shared env file or environment variables. Select platform with `--platform github|gitlab` (default: `github`).
 
-- `GITHUB_TOKEN` (required online)
-- `GITHUB_USERNAME` (required online)
-- `GITHUB_ALLOWED_REPOS` (optional; comma-separated `owner/repo`)
+**Option 1: Configuration File (Recommended)**
 
-GitLab:
-
-- `GITLAB_TOKEN` or `GITLAB_ACTIVITY_TOKEN` (required online)
-- `GITLAB_HOST` (optional host override; takes precedence over `GITLAB_BASE_URL`)
-- `GITLAB_BASE_URL` (optional base URL, default: `https://gitlab.com`)
-- `GITLAB_ALLOWED_REPOS` (required online; comma-separated `group[/subgroup]/repo`)
-- `ALLOWED_REPOS` (legacy fallback for either platform when platform-specific vars are unset)
-
-### Example `.env`
-
+Edit `~/.git-feed/.env` and add your credentials:
 ```bash
 # GitHub (`--platform github`)
+# Required in GitHub online mode
 GITHUB_TOKEN=your_token_here
 GITHUB_USERNAME=your_username
 
 # Optional in GitHub online mode
-GITHUB_ALLOWED_REPOS=owner/repo1,owner/repo2
+GITHUB_ALLOWED_REPOS=user/repo1,user/repo2
 
 # GitLab (`--platform gitlab`)
+# Required in GitLab online mode
 GITLAB_TOKEN=your_token_here
+# Optional alternative token variable
+GITLAB_ACTIVITY_TOKEN=
 
-# Optional host override, e.g. self-managed GitLab
-# If set, this overrides GITLAB_BASE_URL.
-GITLAB_HOST=http://1.1.1.1
-
-# Optional explicit base URL (defaults to https://gitlab.com)
+# Optional host/base URL settings
+GITLAB_HOST=
 GITLAB_BASE_URL=https://gitlab.com
 
 # Required in GitLab online mode
-GITLAB_ALLOWED_REPOS=team/repo1,platform/backend/repo2
+GITLAB_ALLOWED_REPOS=group/repo1,group/subgroup/repo2
 
 # Legacy fallback used only when platform-specific vars are unset
 ALLOWED_REPOS=
 ```
 
-### Token scopes
+**Option 2: Environment Variables**
+```bash
+export GITHUB_TOKEN="your_token_here"
+export GITHUB_USERNAME="your_username"
+export GITHUB_ALLOWED_REPOS="user/repo1,user/repo2"  # Optional in GitHub mode
 
-Create a GitLab Personal Access Token with:
+export GITLAB_TOKEN="your_token_here"
+export GITLAB_ALLOWED_REPOS="group/repo1,group/subgroup/repo2"  # Required in GitLab mode
+```
 
-- `read_api` (recommended)
-- `api` only if your self-managed setup requires broader scope
-
-Reference:
-
-- https://docs.gitlab.com/user/profile/personal_access_tokens/
+**Note:** Environment variables take precedence over the `.env` file.
 
 ## Usage
 
+### Basic Usage
+
 ```bash
-# Default: last month (1m), online mode, platform=github
-./git-feed
+# Monitor items from the last month (default, platform=github)
+git-feed
 
 # Explicit platform
-./git-feed --platform github
-./git-feed --platform gitlab
+git-feed --platform github
+git-feed --platform gitlab
 
-# Time window examples
-./git-feed --time 3h
-./git-feed --time 2d
-./git-feed --time 3w
-./git-feed --time 6m
-./git-feed --time 1y
+# Show items from the last 3 hours
+git-feed --time 3h
 
-# Debug output
-./git-feed --debug
+# Show items from the last 2 days
+git-feed --time 2d
 
-# Offline from cache
-./git-feed --local
+# Show items from the last 3 weeks
+git-feed --time 3w
 
-# Show links
-./git-feed --links
+# Show items from the last 6 months
+git-feed --time 6m
 
-# Shortcut: --local --links
-./git-feed --ll
+# Show items from the last year
+git-feed --time 1y
 
-# Recreate cache DB
-./git-feed --clean
+# Show detailed logging output
+git-feed --debug
 
-# Override allowed repos from CLI
-./git-feed --allowed-repos "owner/repo,owner/other"
-./git-feed --platform gitlab --allowed-repos "group/repo,group/subgroup/repo"
+# Use local database instead of GitHub API (offline mode)
+git-feed --local
+
+# Show hyperlinks underneath each PR/issue
+git-feed --links
+
+# Delete and recreate the database cache (start fresh)
+git-feed --clean
+
+# Filter to specific repositories only
+git-feed --allowed-repos="user/repo1,user/repo2"
+
+# Quick offline mode with links (combines --local and --links)
+git-feed --ll
+
+# Combine flags
+git-feed --local --time 2w --debug --links --allowed-repos="miniohq/ec,tunnels-is/tunnels"
 ```
 
-### Flags
+### Command Line Options
 
 | Flag | Description |
 |------|-------------|
-| `--time RANGE` | Show items from last time range (default: `1m`). Examples: `1h`, `2d`, `3w`, `4m`, `1y` |
+| `--time RANGE` | Show items from the last time range (default: `1m`)<br>Examples: `1h` (hour), `2d` (days), `3w` (weeks), `4m` (months), `1y` (year) |
 | `--platform PLATFORM` | Activity source platform: `github` or `gitlab` (default: `github`) |
-| `--debug` | Show detailed API logging |
-| `--local` | Use local database instead of API |
-| `--links` | Show hyperlinks under each MR/issue |
-| `--ll` | Shortcut for `--local --links` |
-| `--clean` | Delete and recreate the database cache |
-| `--allowed-repos REPOS` | Comma-separated repo paths (GitHub: `owner/repo`; GitLab: `group[/subgroup]/repo`) |
+| `--debug` | Show detailed API call progress instead of progress bar |
+| `--local` | Use local database instead of platform API (offline mode, no token required) |
+| `--links` | Show hyperlinks (with 🔗 icon) underneath each PR and issue |
+| `--ll` | Shortcut for `--local --links` (offline mode with links) |
+| `--clean` | Delete and recreate the database cache (useful for starting fresh or fixing corrupted cache) |
+| `--allowed-repos REPOS` | Filter to specific repositories (GitHub: `owner/repo1`; GitLab: `group[/subgroup]/repo`) |
 
-## Data and cache
+### Color Coding
 
-On first run, the tool creates a shared config dir with one env file and platform-specific cache DBs:
+**Labels:**
+- `AUTHORED` - Cyan
+- `MENTIONED` - Yellow
+- `ASSIGNED` - Magenta
+- `COMMENTED` - Blue
+- `REVIEWED` - Green
+- `REVIEW REQUESTED` - Red
+- `INVOLVED` - Gray
 
-- Shared env:
-  - `~/.git-feed/.env`
-- Platform DBs:
-  - `~/.git-feed/github.db`
-  - `~/.git-feed/gitlab.db`
+**States:**
+- `OPEN` - Green
+- `CLOSED` - Red
+- `MERGED` - Magenta
 
-Online mode fetches platform activity and updates cache.
-Offline mode (`--local`) reads from cache only.
+**Usernames:** Each user gets a consistent color based on hash
+
+## How It Works
+
+### Online Mode (Default)
+
+1. **Parallel Fetching** - Simultaneously searches for activity on the selected platform:
+   - PRs you authored
+   - PRs where you're mentioned
+   - PRs assigned to you
+   - PRs you commented on
+   - PRs you reviewed
+   - PRs requesting your review
+   - PRs involving you
+   - Your recent activity events
+   - Issues you authored/mentioned/assigned/commented
+
+2. **Local Caching** - All fetched data is automatically saved to a local BBolt database (`~/.git-feed/github.db` for GitHub or `~/.git-feed/gitlab.db` for GitLab)
+   - MRs/PRs, issues, and comments/notes are cached for offline access
+   - Each item is stored/updated with a unique key
+   - Database grows as you fetch more data
+
+3. **Cross-Reference Detection** - Automatically finds connections between PRs and issues by:
+   - Checking PR body and comments for issue references (`#123`, `fixes #123`, full URLs)
+   - Checking issue body and comments for PR references
+   - Displaying linked issues directly under their related PRs
+
+4. **Smart Filtering**:
+   - Shows both open and closed items from the specified time period
+   - **Default**: Items updated in last month (`1m`)
+   - **Custom**: Use `--time` with values like `1h`, `2d`, `3w`, `6m`, `1y`
+
+### Offline Mode (`--local`)
+
+- Reads all data from the selected local database instead of platform APIs
+- No internet connection or API token required
+- Displays all cached PR/MR and issue activity
+- Useful for:
+  - Working offline
+  - Faster lookups when you don't need fresh data
+  - Reviewing previously fetched data
+
+## API Rate Limits
+
+GitAI monitors GitHub API rate limits and will warn you when running low:
+- **Search API**: 30 requests per minute
+- **Core API**: 5000 requests per hour
+
+Rate limit status is displayed in debug mode.
+
+### Automatic Retry & Backoff
+
+When rate limits are hit, GitAI automatically retries with exponential backoff:
+- Detects rate limit errors (429, 403 responses)
+- Waits progressively longer between retries (1s → 2s → 4s → ... up to 30s max)
+- Continues indefinitely until the request succeeds
+- Shows clear warnings: `⚠ Rate limit hit, waiting [duration] before retry...`
+- No manual intervention required - the tool handles rate limits gracefully
 
 ## Troubleshooting
 
-### GitHub online mode missing token/user
+### "GITHUB_TOKEN environment variable is required"
+Set up your GitHub token (`GITHUB_TOKEN`) for `--platform github`, or GitLab token (`GITLAB_TOKEN` / `GITLAB_ACTIVITY_TOKEN`) plus `GITLAB_ALLOWED_REPOS` for `--platform gitlab`.
 
-Set `GITHUB_TOKEN` and `GITHUB_USERNAME` in env or `~/.git-feed/.env`.
+### "Rate limit exceeded"
+Wait for the rate limit to reset. Use `--debug` to see current rate limits.
 
-### GitLab online mode missing token
-
-Set `GITLAB_TOKEN` (or `GITLAB_ACTIVITY_TOKEN`) in env or `~/.git-feed/.env`.
-
-### GitLab online mode missing `GITLAB_ALLOWED_REPOS`
-
-Set `GITLAB_ALLOWED_REPOS` with valid project paths (`group[/subgroup]/repo`).
-
-### No open activity found
-
-Try:
-
-- `--debug` to inspect resolved repos and API base URL
-- a wider window (for example `--time 24h`)
-- verifying `GITHUB_ALLOWED_REPOS` / `GITLAB_ALLOWED_REPOS` matches exact project paths
+### Progress bar looks garbled
+Your terminal may not support ANSI colors properly. Use `--debug` mode for plain text output.
 
 ## Development
 
-```bash
-go test ./... -count=1
-go build -o git-feed .
+### Project Structure
+```
+git-feed/
+├── main.go                      # Main application code
+├── platform_github.go           # GitHub platform implementation
+├── platform_gitlab.go           # GitLab platform implementation
+├── db.go                        # Database operations for caching GitHub data
+├── README.md                    # This file
+├── CLAUDE.md                    # Instructions for Claude Code AI assistant
+├── .goreleaser.yml              # GoReleaser configuration for builds
+├── .github/
+│   └── workflows/
+│       └── release.yml          # GitHub Actions workflow for releases
+
+~/.git-feed/                  # Config directory (auto-created)
+ ├── .env                     # Shared configuration file
+ ├── github.db                # BBolt database for GitHub cache
+ └── gitlab.db                # BBolt database for GitLab cache
 ```
 
-Current core files:
+### Testing Releases Locally
 
-- `main.go`
-- `db.go`
-- `priority_test.go`
-- `CLAUDE.md`
-- `README.md`
+You can test the GoReleaser build locally before pushing a tag:
+
+```bash
+# Install goreleaser
+go install github.com/goreleaser/goreleaser/v2@latest
+
+# Test the build (creates snapshot without publishing)
+goreleaser release --snapshot --clean
+
+# Check the dist/ folder for built binaries
+ls -la dist/
+```
 
 ## License
 
-MIT
+MIT License - Feel free to use and modify as needed.
